@@ -91,7 +91,7 @@
     "placeholders": {
       "port": {
         "content": "$1",
-        "example": "15151"
+        "example": "15515"
       }
     }
   },
@@ -100,7 +100,7 @@
     "placeholders": {
       "port": {
         "content": "$1",
-        "example": "15151"
+        "example": "15515"
       }
     }
   },

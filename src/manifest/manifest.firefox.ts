@@ -16,7 +16,7 @@ export function getManifestForFirefox(): ManifestV2 {
         },
         browser_specific_settings: {
             gecko: {
-                id: "firefox-integration@abdownloadmanager.com",
+                id: "firefox-integration@webdm",
             }
         },
         browser_action: getBrowserActionInfo(),

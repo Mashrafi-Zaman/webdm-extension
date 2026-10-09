@@ -1,0 +1,13 @@
+Web Download Manager (WebDM)
+Copyright 2026-present WebDM contributors
+
+This product is a modified fork of the AB Download Manager browser extension
+(https://github.com/amir1376/ab-download-manager-browser-integration), created by amir1376
+and licensed under the Apache License, Version 2.0.
+Original copyright notices are retained in the source files and in LICENSE.
+
+Changes made in this fork include, among others: rebranding to
+"Web Download Manager" / "WebDM", and a separate
+Firefox add-on ID, integration port and native-messaging host name.
+
+WebDM is not affiliated with or endorsed by the AB Download Manager project.
