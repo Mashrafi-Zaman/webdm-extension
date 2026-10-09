@@ -19,6 +19,8 @@ import _ from "lodash";
 import * as BackgroundSharedState from "~/background/BackgroundSharedState";
 import * as HLSUtils from "~/media/HLSUtils";
 import {whenBackgroundReady} from "~/background/BackgroundReady";
+import {parseSegment} from "~/media/SegmentUtils";
+import {isDebugEnabled, recordDetection} from "~/media/DetectionDebugLog";
 
 type TabInfo = {
     title?: string,
@@ -322,30 +324,31 @@ export abstract class DownloadLinkInterceptor {
             async (details) => {
                 await whenBackgroundReady()
                 const request = this.pendingRequests[details.requestId]
-                const contentType = getContentType(getHeaders(details.responseHeaders))
-                // HLS playlists: by ".m3u8" in the path or by Content-Type (players fetch them via XHR/fetch,
-                // or as "media" when the browser plays HLS natively)
-                if (HLSUtils.isHLSPlaylist(details.url, contentType)) {
-                    // the request may have started before a service-worker restart; headers are optional for playlists
-                    this.checkForStreamManifest(details, request?.finalRequest, "hls")
-                    return
-                }
-                if (HLSUtils.isDASHManifest(details.url, contentType)) {
-                    this.checkForStreamManifest(details, request?.finalRequest, "dash")
-                    return
-                }
-                if (!request) {
-                    return
-                }
-                if (details.type === "media") {
-                    this.checkForDirectMedia(details, request.finalRequest, false)
-                } else if (isWholeMediaFileFromScript(details.statusCode, contentType)) {
-                    // MP4/audio files loaded by a script (XHR/fetch), e.g. players that fetch then play a blob:
-                    this.checkForDirectMedia(details, request.finalRequest, true)
+                const responseHeaders = getHeaders(details.responseHeaders)
+                const contentType = getContentType(responseHeaders)
+                const rangeHeader = getHeaders(request?.finalRequest.requestHeaders).get("Range")
+                const classification = this.classifyMediaResponse(details, request, contentType, rangeHeader)
+                if (classification !== null && isDebugEnabled()) {
+                    recordDetection(details.tabId, {
+                        source: "webRequest",
+                        url: details.url,
+                        frameId: details.frameId,
+                        frameUrl: (details as RequestDetailsWithFrame).documentUrl,
+                        requestType: details.type,
+                        method: details.method,
+                        statusCode: details.statusCode,
+                        contentType: contentType,
+                        size: getContentLength(responseHeaders),
+                        range: rangeHeader,
+                        initiator: getInitiator(details),
+                        requestHeaders: getHeaderRecord(request?.finalRequest.requestHeaders),
+                        classification: classification,
+                    })
                 }
             },
             {
-                types: ["media", "xmlhttprequest"],
+                // "other": requests from a page's service worker
+                types: ["media", "xmlhttprequest", "other"],
                 urls: ["*://*/*"],
             },
             [
@@ -571,6 +574,7 @@ export abstract class DownloadLinkInterceptor {
                 frameId: frameId,
                 frameUrl: frameUrl,
                 content: item.content ?? undefined,
+                mime: item.mime ?? undefined,
             })
         }
     }
@@ -646,6 +650,72 @@ export abstract class DownloadLinkInterceptor {
         onMediaDetectedListener: OnMediaInterceptedFromRequestListener | null
     ) {
         this.onMediaDetectedListener = onMediaDetectedListener
+    }
+
+    /**
+     * Handle a media-related response; returns what it was taken for ("hls", "segment", ...), "ignored" for
+     * other media-looking responses, or null for responses that aren't media-related at all.
+     */
+    private classifyMediaResponse(
+        details: WebRequest.OnResponseStartedDetailsType,
+        request: InterceptedBrowserRequestWithResponse | undefined,
+        contentType: string | null,
+        rangeHeader: string | null,
+    ): string | null {
+        // HLS playlists: by ".m3u8" in the path or by Content-Type (players fetch them via XHR/fetch,
+        // or as "media" when the browser plays HLS natively)
+        if (HLSUtils.isHLSPlaylist(details.url, contentType)) {
+            // the request may have started before a service-worker restart; headers are optional for playlists
+            this.checkForStreamManifest(details, request?.finalRequest, "hls")
+            return "hls"
+        }
+        if (HLSUtils.isDASHManifest(details.url, contentType)) {
+            this.checkForStreamManifest(details, request?.finalRequest, "dash")
+            return "dash"
+        }
+        // stream segments are never listed on their own; they're grouped to find or rebuild their stream
+        const segment = parseSegment(details.url, contentType, rangeHeader)
+        if (segment) {
+            this.checkForSegment(details, request?.finalRequest, rangeHeader)
+            return segment.isInit ? "init-segment" : "segment"
+        }
+        const mediaLike = isMediaLikeResponse(details.type, contentType)
+        if (!request || details.type === "other") {
+            return mediaLike ? "ignored" : null
+        }
+        if (details.type === "media") {
+            this.checkForDirectMedia(details, request.finalRequest, false)
+            return "media"
+        }
+        if (isWholeMediaFileFromScript(details.statusCode, contentType)) {
+            // MP4/audio files loaded by a script (XHR/fetch), e.g. players that fetch then play a blob:
+            this.checkForDirectMedia(details, request.finalRequest, true)
+            return "media (script)"
+        }
+        return mediaLike ? "ignored" : null
+    }
+
+    private checkForSegment(
+        details: WebRequest.OnResponseStartedDetailsType,
+        request: WebRequest.OnSendHeadersDetailsType | undefined,
+        rangeHeader: string | null,
+    ) {
+        if (!this.shouldProcessMedia(details, true)) {
+            return
+        }
+        this.onMediaDetected(
+            details.tabId,
+            {
+                type: "media",
+                mediaType: "segment",
+                url: details.url,
+                requestHeaders: getHeaders(request?.requestHeaders),
+                responseHeaders: getHeaders(details.responseHeaders),
+                rangeHeader: rangeHeader,
+                ...frameInfo(details),
+            },
+            getInitiator(details),
+        )
     }
 
     private checkForStreamManifest(
@@ -749,8 +819,10 @@ export abstract class DownloadLinkInterceptor {
 /** Media a content script reports (see onMediaReportedByFrame) */
 export type ReportedMedia = {
     url: string,
-    kind: "hls" | "dash" | "http",
+    kind: "hls" | "dash" | "http" | "segment",
     content?: string | null,
+    // segment URLs the page appended to a MediaSource SourceBuffer of this mime type (from the page hook)
+    mime?: string | null,
 }
 
 type RequestDetailsWithFrame = WebRequest.OnResponseStartedDetailsType & {
@@ -782,6 +854,22 @@ function isWholeMediaFileFromScript(statusCode: number, contentType: string | nu
         return false
     }
     return !type.startsWith("video/mp2t") && !HLSUtils.isHLSContentType(type)
+}
+
+/** Worth a line in the debug log even when WebDM ignores it. */
+function isMediaLikeResponse(type: string, contentType: string | null): boolean {
+    if (type === "media") return true
+    const t = contentType?.toLowerCase() ?? ""
+    return /^(video|audio)\//.test(t) || t.includes("mpegurl") || t.includes("dash") || t.startsWith("application/octet-stream")
+}
+
+function getHeaderRecord(headers?: browser.WebRequest.HttpHeaders): Record<string, string> | undefined {
+    if (!headers) return undefined
+    const record: Record<string, string> = {}
+    headers.forEach(h => {
+        if (h.value !== undefined) record[h.name] = h.value
+    })
+    return record
 }
 
 function getHeaders(responseHeaders?: browser.WebRequest.HttpHeaders): Headers {

@@ -16,6 +16,7 @@ import {setBackgroundReady, whenBackgroundReady} from "~/background/BackgroundRe
 import {registerContentScriptInjection} from "~/background/ContentScriptInjector";
 import {MediaRegistry} from "~/media/MediaRegistry";
 import {DownloadLinkInterceptor} from "~/linkgrabber/DownloadLinkInterceptor";
+import {getDetectionLog, recordDetection} from "~/media/DetectionDebugLog";
 
 function receiveMessageFromContentScripts(
     mediaRegistry: MediaRegistry,
@@ -59,18 +60,66 @@ function receiveMessageFromContentScripts(
         if (!Number.isInteger(tabId) || tabId < 0 || !Number.isInteger(frameId)) {
             return
         }
-        const {frameUrl, items} = msg.data
+        const {frameUrl, items, videoDuration, debugEvents} = msg.data
         let pageUrl: string | null = null
         try {
             pageUrl = (await browser.tabs.get(tabId)).url ?? null
         } catch (e) {
             // tab is gone
         }
+        debugEvents?.forEach(event => recordDetection(tabId, {...event, frameId, frameUrl}))
         await mediaRegistry.onFrameReported(tabId, frameId, frameUrl)
+        if (videoDuration) {
+            await mediaRegistry.onFrameVideoDuration(tabId, frameId, videoDuration)
+        }
         interceptor.onMediaReportedByFrame(tabId, frameId, frameUrl, pageUrl, items)
         // also re-send what we already know for this tab (restored from storage.session)
         await mediaRegistry.publish(tabId)
     })
+    onMessage(DefinedCommands.EXPORT_DETECTION_LOG, async (msg) => {
+        await whenBackgroundReady()
+        return await exportDetectionLog(msg.data.tabId, mediaRegistry)
+    })
+}
+
+/** Debug mode: save a JSON with the tab's media requests and WebDM's conclusions (Save As dialog). */
+async function exportDetectionLog(tabId: number, mediaRegistry: MediaRegistry): Promise<boolean> {
+    try {
+        const tab = await browser.tabs.get(tabId)
+        const report = {
+            exportedAt: new Date().toISOString(),
+            extension: `${browser.runtime.getManifest().name} ${browser.runtime.getManifest().version}`,
+            userAgent: navigator.userAgent,
+            tab: {url: tab.url, title: tab.title},
+            note: "Cookie / Authorization header values are redacted.",
+            entries: await getDetectionLog(tabId),
+            detectedState: await mediaRegistry.snapshot(tabId),
+        }
+        const json = JSON.stringify(report, null, 2)
+        // the popup closes when the Save As dialog opens, so the background starts the download (data: URL;
+        // WebDM's own download capture ignores non-http URLs)
+        const bytes = new TextEncoder().encode(json)
+        let binary = ""
+        for (let i = 0; i < bytes.length; i += 0x8000) {
+            binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000))
+        }
+        let host = "page"
+        try {
+            host = new URL(tab.url ?? "").hostname.replace(/[^a-z0-9.-]/gi, "_") || "page"
+        } catch (e) {
+            // keep "page"
+        }
+        const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)
+        await browser.downloads.download({
+            url: `data:application/json;base64,${btoa(binary)}`,
+            filename: `webdm-detection-log-${host}-${stamp}.json`,
+            saveAs: true,
+        })
+        return true
+    } catch (e) {
+        console.warn("can't export the detection log", e)
+        return false
+    }
 }
 
 /**

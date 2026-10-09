@@ -1,4 +1,6 @@
-export type InterceptedMediaType = "hls" | "http" | "dash";
+// "segment": a piece of a stream (fMP4/TS/CMAF segment or init segment). Never listed on its own; used to
+// link a stream to its manifest or to rebuild it.
+export type InterceptedMediaType = "hls" | "http" | "dash" | "segment";
 export type InterceptedMediaResult = {
     type: "media",
     mediaType: InterceptedMediaType,
@@ -13,4 +15,7 @@ export type InterceptedMediaResult = {
     content?: string,
     // MP4/audio fetched by a script (XHR/fetch) rather than a <video>/<audio> element
     viaScript?: boolean,
+    // segments: Range header of the request, and the MSE SourceBuffer mime type the bytes went to (if known)
+    rangeHeader?: string | null,
+    mime?: string,
 }

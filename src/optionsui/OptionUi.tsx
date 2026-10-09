@@ -104,6 +104,13 @@ class ToolsViewModel extends EventAwareViewModel<ToolsViewModelEvent> implements
     @observable
     bypassShortcut!: string
 
+    @observable
+    debug!: boolean
+
+    setDebug(value: boolean) {
+        Configs.setConfigItem("debug", value)
+    }
+
     setAutoCaptureLinks(value: boolean) {
         Configs.setConfigItem("autoCaptureLinks", value)
     }
@@ -294,6 +301,8 @@ const SettingsSection: React.FC<{ vm: ToolsViewModel }> = observer((props) => {
             />
             <Divider/>
             <SendCookiesSection enabled={vm.sendHeaders} toggle={(v) => vm.setSendHeaders(v)}/>
+            <Divider/>
+            <DebugSection enabled={vm.debug} toggle={(v) => vm.setDebug(v)}/>
         </div>
     </div>
 })
@@ -775,6 +784,28 @@ function SendCookiesSection(
         description={
             <div>
                 {browser.i18n.getMessage("config_send_cookies_descrption")}
+            </div>
+        }
+    />
+}
+
+function DebugSection(
+    props: {
+        enabled: boolean,
+        toggle: (v: boolean) => void
+    }
+) {
+    return <OptionItem
+        title={
+            <div>{browser.i18n.getMessage("config_debug")}</div>
+        }
+        toggle={
+            <input checked={props.enabled} onChange={e => props.toggle(e.target.checked)} type="checkbox"
+                   className="checkbox"/>
+        }
+        description={
+            <div>
+                {browser.i18n.getMessage("config_debug_description")}
             </div>
         }
     />

@@ -1,9 +1,12 @@
 // WebDM Integration - page hook (runs in the page's MAIN world, at document_start, in all frames).
 //
-// Spots HLS playlists (and DASH manifests) that players fetch with fetch()/XMLHttpRequest from URLs that
-// don't end in .m3u8/.mpd, including blob: URLs, by looking at the first bytes of the response body.
-// Found playlists are handed to WebDM's content script (isolated world) through a DOM event; the
-// content script forwards them to the extension. The page's own requests and responses are not changed.
+// 1. Spots HLS playlists (and DASH manifests) that players fetch with fetch()/XMLHttpRequest from URLs that
+//    don't end in .m3u8/.mpd, including blob: URLs, by looking at the first bytes of the response body.
+// 2. Watches MediaSource/SourceBuffer: which mime types/codecs the player uses (separate audio and video?)
+//    and which fetched URLs end up in which SourceBuffer (matched by byte length), so stream segments can be
+//    grouped and their streams rebuilt.
+// Findings go to WebDM's content script (isolated world) through DOM events; the content script forwards
+// them to the extension. The page's own requests, responses and media data are not changed.
 (function () {
     "use strict";
     var MARK = "__webdmPageHookInstalled";
@@ -18,7 +21,7 @@
 
     var MAX_SIZE = 2 * 1024 * 1024;
     var EVENT_NAME = "webdm:page-media";
-    var CONTENT_READY_EVENT = "webdm:content-ready"; // content script -> hook: "I'm listening"
+    var CONTENT_READY_EVENT = "webdm:content-ready"; // content script -> hook: "I'm listening" (+ settings)
     var HOOK_READY_EVENT = "webdm:hook-ready"; // hook -> content script: "announce yourself again"
     var MAX_REPLAY = 50;
 
@@ -26,7 +29,9 @@
     // playlists early would be missed. Keep recent findings and replay them whenever a content script
     // announces itself (also after an extension reload, when a new content script starts).
     var recent = [];
+    var recentSegments = [];
     var contentScriptListening = false;
+    var debugMode = false;
 
     function dispatch(detail) {
         try {
@@ -36,28 +41,66 @@
         }
     }
 
-    function report(url, kind, content) {
+    function absolute(url) {
+        try {
+            return new URL(String(url), location.href).href;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // data: {url, kind: "hls" | "dash" | "segment" | "debug", ...}
+    function report(data, replayable) {
         var detail;
         try {
-            var absolute = new URL(String(url), location.href).href;
             // a string: objects don't cross from the page's world to the content script's world
-            detail = JSON.stringify({url: absolute, kind: kind, content: content});
+            detail = JSON.stringify(data);
         } catch (e) {
             return;
         }
-        recent.push(detail);
-        if (recent.length > MAX_REPLAY) {
-            recent.shift();
+        if (replayable) {
+            // segments get their own (smaller) buffer so a busy player can't push playlists out
+            var buffer = data.kind === "segment" ? recentSegments : recent;
+            buffer.push(detail);
+            if (buffer.length > (data.kind === "segment" ? 20 : MAX_REPLAY)) {
+                buffer.shift();
+            }
         }
         if (contentScriptListening) {
             dispatch(detail);
         }
     }
 
-    document.addEventListener(CONTENT_READY_EVENT, function () {
+    function reportManifest(url, kind, content) {
+        var abs = absolute(url);
+        if (abs) {
+            report({url: abs, kind: kind, content: content}, true);
+        }
+    }
+
+    function reportDebug(url, requestType, contentType, size, classification) {
+        if (!debugMode) {
+            return;
+        }
+        var abs = absolute(url);
+        if (abs) {
+            report({
+                kind: "debug", url: abs, requestType: requestType, contentType: contentType || null,
+                size: typeof size === "number" ? size : null, classification: classification || null
+            }, false);
+        }
+    }
+
+    document.addEventListener(CONTENT_READY_EVENT, function (event) {
         contentScriptListening = true;
-        for (var i = 0; i < recent.length; i++) {
-            dispatch(recent[i]);
+        try {
+            debugMode = !!(event.detail && JSON.parse(event.detail).debug);
+        } catch (e) {
+            // ignore
+        }
+        var all = recent.concat(recentSegments);
+        for (var i = 0; i < all.length; i++) {
+            dispatch(all[i]);
         }
     });
     try {
@@ -79,6 +122,14 @@
         return null;
     }
 
+    function isBinaryMedia(contentType) {
+        var type = (contentType || "").toLowerCase();
+        if (type.indexOf("mpegurl") >= 0 || type.indexOf("dash") >= 0) {
+            return false;
+        }
+        return /^(video|audio)\//.test(type) || type.indexOf("octet-stream") >= 0 || type.indexOf("iso.segment") >= 0;
+    }
+
     function looksBinary(contentType) {
         var type = (contentType || "").toLowerCase();
         if (type.indexOf("mpegurl") >= 0 || type.indexOf("dash") >= 0) {
@@ -87,18 +138,90 @@
         return /^(video|audio|image|font)\//.test(type);
     }
 
+    // ---------- recent binary responses, to learn which URL each SourceBuffer.appendBuffer() came from ----------
+    var binaryResponses = []; // {url, size, used}
+    function rememberBinary(url, size) {
+        if (!url || !size) {
+            return;
+        }
+        binaryResponses.push({url: url, size: size, used: false});
+        if (binaryResponses.length > 100) {
+            binaryResponses.shift();
+        }
+    }
+
+    // exact matches first: the appended buffer IS the body of a fetch Response / XHR we saw
+    var bufferUrls = new WeakMap(); // ArrayBuffer -> url (from Response.arrayBuffer())
+    var recentXhrs = []; // XMLHttpRequest objects (their .response is compared by identity)
+
+    function urlForAppendedData(data) {
+        var buffer = data && data.buffer instanceof ArrayBuffer ? data.buffer : data;
+        if (buffer && bufferUrls.has(buffer)) {
+            return bufferUrls.get(buffer);
+        }
+        for (var x = recentXhrs.length - 1; x >= 0; x--) {
+            var xhr = recentXhrs[x] && recentXhrs[x].deref ? recentXhrs[x].deref() : recentXhrs[x];
+            if (!xhr) {
+                continue;
+            }
+            try {
+                if (xhr.readyState === 4 && xhr.responseType === "arraybuffer" && xhr.response === buffer) {
+                    return xhr.responseURL || null;
+                }
+            } catch (e) {
+                // ignore
+            }
+        }
+        // last resort: a recent binary response of the same size
+        var size = data && typeof data.byteLength === "number" ? data.byteLength : 0;
+        for (var i = binaryResponses.length - 1; i >= 0; i--) {
+            var r = binaryResponses[i];
+            if (!r.used && r.size === size) {
+                r.used = true;
+                return r.url;
+            }
+        }
+        return null;
+    }
+
+    if (window.Response && Response.prototype.arrayBuffer) {
+        var originalArrayBuffer = Response.prototype.arrayBuffer;
+        Response.prototype.arrayBuffer = function () {
+            var response = this;
+            var promise = originalArrayBuffer.apply(this, arguments);
+            try {
+                promise.then(function (buffer) {
+                    try {
+                        if (response.url && buffer) {
+                            bufferUrls.set(buffer, response.url);
+                        }
+                    } catch (e) {
+                        // ignore
+                    }
+                }, function () {
+                });
+            } catch (e) {
+                // ignore
+            }
+            return promise;
+        };
+    }
+
     // ---------- fetch ----------
     var originalFetch = window.fetch;
     if (typeof originalFetch === "function") {
         var inspectResponse = function (response) {
-            if (!response || !response.body || response.type === "opaque" || response.bodyUsed) {
+            if (!response || response.type === "opaque") {
                 return;
             }
-            var length = Number(response.headers.get("content-length"));
-            if (length && length > MAX_SIZE) {
+            var contentType = response.headers.get("content-type");
+            var length = Number(response.headers.get("content-length")) || null;
+            if (isBinaryMedia(contentType)) {
+                rememberBinary(response.url, length);
+                reportDebug(response.url, "fetch", contentType, length, "binary");
                 return;
             }
-            if (looksBinary(response.headers.get("content-type"))) {
+            if (!response.body || response.bodyUsed || (length && length > MAX_SIZE) || looksBinary(contentType)) {
                 return;
             }
             var reader;
@@ -116,7 +239,8 @@
                 return reader.read().then(function (chunk) {
                     if (chunk.done) {
                         if (kind) {
-                            report(response.url, kind, text + decoder.decode());
+                            reportManifest(response.url, kind, text + decoder.decode());
+                            reportDebug(response.url, "fetch", contentType, total, kind);
                         }
                         return;
                     }
@@ -179,29 +303,51 @@
                 return;
             }
             var type = xhr.responseType;
+            var contentType = null;
+            try {
+                contentType = xhr.getResponseHeader("content-type");
+            } catch (e) {
+                // ignore
+            }
             if (type === "" || type === "text") {
                 var body = xhr.responseText;
                 if (body && body.length <= MAX_SIZE) {
                     var kind = sniff(body.slice(0, 512));
                     if (kind) {
-                        report(url, kind, body);
+                        reportManifest(url, kind, body);
+                        reportDebug(url, "xhr", contentType, body.length, kind);
                     }
                 }
-            } else if (type === "arraybuffer" && xhr.response && xhr.response.byteLength <= MAX_SIZE) {
+            } else if (type === "arraybuffer" && xhr.response) {
                 var buffer = xhr.response;
-                var head = new TextDecoder().decode(new Uint8Array(buffer, 0, Math.min(512, buffer.byteLength)));
-                var bufferKind = sniff(head);
-                if (bufferKind) {
-                    report(url, bufferKind, new TextDecoder().decode(new Uint8Array(buffer)));
+                var bufferKind = null;
+                if (buffer.byteLength <= MAX_SIZE && !isBinaryMedia(contentType)) {
+                    var head = new TextDecoder().decode(new Uint8Array(buffer, 0, Math.min(512, buffer.byteLength)));
+                    bufferKind = sniff(head);
                 }
-            } else if (type === "blob" && xhr.response && xhr.response.size <= MAX_SIZE && !looksBinary(xhr.response.type)) {
-                xhr.response.text().then(function (blobText) {
-                    var blobKind = sniff(blobText.slice(0, 512));
-                    if (blobKind) {
-                        report(url, blobKind, blobText);
+                if (bufferKind) {
+                    reportManifest(url, bufferKind, new TextDecoder().decode(new Uint8Array(buffer)));
+                    reportDebug(url, "xhr", contentType, buffer.byteLength, bufferKind);
+                } else {
+                    rememberBinary(url, buffer.byteLength);
+                    if (isBinaryMedia(contentType)) {
+                        reportDebug(url, "xhr", contentType, buffer.byteLength, "binary");
                     }
-                }, function () {
-                });
+                }
+            } else if (type === "blob" && xhr.response) {
+                var blob = xhr.response;
+                if (isBinaryMedia(blob.type || contentType)) {
+                    rememberBinary(url, blob.size);
+                    reportDebug(url, "xhr", blob.type || contentType, blob.size, "binary");
+                } else if (blob.size <= MAX_SIZE && !looksBinary(blob.type)) {
+                    blob.text().then(function (blobText) {
+                        var blobKind = sniff(blobText.slice(0, 512));
+                        if (blobKind) {
+                            reportManifest(url, blobKind, blobText);
+                        }
+                    }, function () {
+                    });
+                }
             }
         };
 
@@ -216,7 +362,17 @@
         proto.send = function () {
             try {
                 var xhr = this;
-                xhr.addEventListener("load", function () {
+                // weakly held: never keep the page's responses (segment bytes) alive
+                recentXhrs.push(typeof WeakRef === "function" ? new WeakRef(xhr) : xhr);
+                if (recentXhrs.length > (typeof WeakRef === "function" ? 50 : 8)) {
+                    recentXhrs.shift();
+                }
+                // readystatechange (DONE) fires before "load": players usually append the bytes to a SourceBuffer
+                // from their onload handler, so the response must be remembered before that
+                xhr.addEventListener("readystatechange", function () {
+                    if (xhr.readyState !== 4) {
+                        return;
+                    }
                     try {
                         inspectXhr(xhr);
                     } catch (e) {
@@ -227,6 +383,40 @@
                 // ignore
             }
             return originalSend.apply(this, arguments);
+        };
+    }
+
+    // ---------- MediaSource / SourceBuffer ----------
+    var sourceBufferMime = new WeakMap();
+    var MS = window.MediaSource || window.ManagedMediaSource;
+    if (MS && MS.prototype && MS.prototype.addSourceBuffer) {
+        var originalAddSourceBuffer = MS.prototype.addSourceBuffer;
+        MS.prototype.addSourceBuffer = function (mime) {
+            var sourceBuffer = originalAddSourceBuffer.apply(this, arguments);
+            try {
+                sourceBufferMime.set(sourceBuffer, String(mime));
+                if (debugMode) {
+                    report({kind: "debug", url: location.href, requestType: "mse", mime: String(mime), classification: "addSourceBuffer"}, false);
+                }
+            } catch (e) {
+                // ignore
+            }
+            return sourceBuffer;
+        };
+    }
+    var SB = window.SourceBuffer || window.ManagedSourceBuffer;
+    if (SB && SB.prototype && SB.prototype.appendBuffer) {
+        var originalAppendBuffer = SB.prototype.appendBuffer;
+        SB.prototype.appendBuffer = function (data) {
+            try {
+                var url = urlForAppendedData(data);
+                if (url) {
+                    report({kind: "segment", url: url, mime: sourceBufferMime.get(this) || null}, true);
+                }
+            } catch (e) {
+                // ignore
+            }
+            return originalAppendBuffer.apply(this, arguments);
         };
     }
 })();

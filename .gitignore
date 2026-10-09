@@ -5,3 +5,6 @@
 
 .idea
 .vscode
+
+# detection logs exported in debug mode
+debug/

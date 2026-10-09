@@ -80,6 +80,8 @@ const ConfigType = z.object({
         return "Delete"
     }),
     apiKey: z.string().catch(""),
+    // shows "Export detection log" in the toolbar popup and records media requests for it
+    debug: z.boolean().catch(false),
 })
 
 export type Config = z.infer<typeof ConfigType>

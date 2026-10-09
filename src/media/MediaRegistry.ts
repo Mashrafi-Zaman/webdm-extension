@@ -131,6 +131,18 @@ export class MediaRegistry implements OnMediaInterceptedFromRequestListener {
         await mediaOnTab.publish()
     }
 
+    async onFrameVideoDuration(tabId: number, frameId: number, duration: number) {
+        if (tabId < 0) {
+            return
+        }
+        await (await this.getMediaOnTab(tabId)).setFrameDuration(frameId, duration)
+    }
+
+    /** What WebDM currently knows about a tab (for the debug export; header values redacted). */
+    async snapshot(tabId: number) {
+        return (await this.getMediaOnTab(tabId)).getStateSnapshot()
+    }
+
     async getFrameUrl(tabId: number, frameId: number): Promise<string | undefined> {
         if (tabId < 0) {
             return undefined

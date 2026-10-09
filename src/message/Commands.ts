@@ -11,4 +11,5 @@ export const DefinedCommands = Object.freeze({
     GET_PLATFORM: "get_platform",
     DOWNLOADABLE_MEDIA_DETECTED: "downloadable_media_detected",
     REPORT_FRAME_MEDIA: "report_frame_media",
+    EXPORT_DETECTION_LOG: "export_detection_log",
 })

@@ -32,6 +32,7 @@ class BrowserActionViewModel extends BaseViewModel {
             this.autoCaptureLinks = config.autoCaptureLinks
             this.popupEnabled = config.popupEnabled
             this.silentAddDownload = config.silentAddDownload
+            this.debug = config.debug
         })
         run(async () => {
             const isAppReachable = await sendMessage(
@@ -49,9 +50,34 @@ class BrowserActionViewModel extends BaseViewModel {
     autoCaptureLinks!: boolean
     @observable
     silentAddDownload!: boolean
+    @observable
+    debug!: boolean
 
     @observable
     canReachable: boolean | null = null
+
+    @observable
+    exportFailed = false
+
+    @action
+    setExportFailed(value: boolean) {
+        this.exportFailed = value
+    }
+
+    exportDetectionLog() {
+        run(async () => {
+            const [tab] = await browser.tabs.query({active: true, currentWindow: true})
+            if (tab?.id === undefined) {
+                this.setExportFailed(true)
+                return
+            }
+            const ok = await sendMessage(DefinedCommands.EXPORT_DETECTION_LOG, {tabId: tab.id}, "background")
+            this.setExportFailed(!ok)
+            if (ok) {
+                window.close()
+            }
+        })
+    }
 
     @action
     setCanReachable(value: boolean) {
@@ -130,6 +156,13 @@ const BrowserActionUi: React.FC<{
             <AutoCaptureSection enabled={vm.autoCaptureLinks} toggle={(v) => vm.setAutoCaptureLinks(v)}/>
             <EnableSection enabled={vm.popupEnabled} toggle={(v) => vm.setPopupEnabled(v)}/>
             <SilentAddDownload enabled={vm.silentAddDownload} toggle={(v) => vm.setSilentAddDownload(v)}/>
+            {vm.debug && <OptionItem
+                left={<div>{browser.i18n.getMessage("export_detection_log")}</div>}
+                right={vm.exportFailed
+                    ? <span className="text-red-500">{browser.i18n.getMessage("export_detection_log_failed")}</span>
+                    : <span className="opacity-60">.json</span>}
+                onClick={() => vm.exportDetectionLog()}
+            />}
             <MoreSettings/>
         </div>
     </div>

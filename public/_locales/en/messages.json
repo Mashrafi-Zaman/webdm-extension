@@ -166,5 +166,17 @@
   },
   "config_bypass_shortcut_description": {
     "message": "When auto-capture of download links is enabled, holding down the shortcut key and clicking on the download link uses the internal browser download method."
+  },
+  "config_debug": {
+    "message": "Debug"
+  },
+  "config_debug_description": {
+    "message": "Records the media requests of each tab so you can export them from the toolbar popup (\"Export detection log\") when a video isn't detected correctly. Cookie and authorization header values are never recorded. Turn it off when you're done."
+  },
+  "export_detection_log": {
+    "message": "Export detection log"
+  },
+  "export_detection_log_failed": {
+    "message": "Couldn't export the detection log"
   }
 }

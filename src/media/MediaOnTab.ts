@@ -12,6 +12,9 @@ import {getContentDisposition, getContentLength, getContentType} from "~/utils/H
 import {getFileExtension, getFileFromUrl, getFileNameWithoutExtension} from "~/utils/URLUtils";
 import {getFileNameFromHeader} from "~/utils/ExtractFileNameFromHeader";
 import {TabMediaStore} from "~/media/TabMediaStore";
+import * as SegmentUtils from "~/media/SegmentUtils";
+import {SegmentTrack} from "~/media/SegmentUtils";
+import {redactHeaders} from "~/media/DetectionDebugLog";
 
 // ---------- persisted (serializable) per-tab state ----------
 
@@ -54,6 +57,8 @@ type HLSMediaPlaylistEntry = BaseEntry & {
     extension?: string, // of the downloaded file: ts / mp4 / aac ...
     duration?: number,
     encryption: HLSEncryption,
+    // SegmentUtils group keys of this playlist's segments (to link captured segments to it)
+    segmentKeys?: string[],
 }
 
 type DASHEntry = BaseEntry & {
@@ -61,18 +66,57 @@ type DASHEntry = BaseEntry & {
     duration?: number,
     maxHeight?: number,
     isDrm: boolean,
+    segmentKeys?: string[],
 }
 
 type MediaEntry = HttpMediaEntry | HLSMasterEntry | HLSMediaPlaylistEntry | DASHEntry
+
+/** Segments of one stream/quality seen in a frame (see SegmentUtils.parseSegment). */
+type SegmentGroup = {
+    key: string,
+    frameId: number,
+    base: string, // origin + directory
+    template?: string, // URL with "{N}"; absent if the segments aren't numbered
+    pad?: number,
+    initUrl?: string,
+    min?: number,
+    max?: number,
+    count: number,
+    track: SegmentTrack,
+    mime?: string, // from the MSE hook
+    contentType?: string,
+    height?: number,
+    token: string,
+    headers: HeadersRecord,
+    sizes: number[], // sample of segment sizes (bytes)
+    probe?: { status: "running" | "done" | "failed", first?: number, last?: number },
+}
 
 export type TabMediaState = {
     entries: Record<string, MediaEntry>,
     // frameId -> URL of the document in that frame (as reported by its content script / requests)
     frames: Record<string, string>,
+    segmentGroups: Record<string, SegmentGroup>,
+    // frameId -> duration (s) of the frame's main <video>, for streams rebuilt from segments
+    frameDurations: Record<string, number>,
 }
 
 export function emptyTabMediaState(): TabMediaState {
-    return {entries: {}, frames: {}}
+    return {entries: {}, frames: {}, segmentGroups: {}, frameDurations: {}}
+}
+
+/** A stream rebuilt from numbered segments, sent to the app as {type: "segments"} */
+export type SegmentsTrackJob = {
+    init?: string,
+    template: string,
+    first: number,
+    last: number,
+    pad?: number,
+}
+export type SegmentsJob = {
+    video: SegmentsTrackJob,
+    audio?: SegmentsTrackJob,
+    headers: Record<string, string>,
 }
 
 // ---------- what the content script receives ----------
@@ -87,11 +131,13 @@ export type DownloadableMediaQuality = {
     bandwidth?: string,
     resolution?: string,
     extension?: string,
+    size?: string,
     note?: string,
+    segmentsJob?: SegmentsJob,
 }
 
 export type DownloadableMedia = {
-    type: InterceptedMediaType,
+    type: InterceptedMediaType | "segments",
     uri: string,
     requestHeaders?: Record<string, string>,
     displayName?: string
@@ -105,6 +151,8 @@ export type DownloadableMedia = {
     note?: string,
     // false: listed for information only (e.g. DASH until the app supports it)
     downloadable?: boolean,
+    // type "segments": the stream rebuilt from its numbered segments
+    segmentsJob?: SegmentsJob,
     // for HLS master playlists: one entry per video, best quality first (uri/displayName above = qualities[0])
     qualities?: DownloadableMediaQuality[],
 }
@@ -189,6 +237,13 @@ export class MediaOnTab {
                 }
             }
         }
+        // probes of segment groups interrupted by a service-worker restart
+        for (const group of Object.values(this.state.segmentGroups)) {
+            if (group.probe?.status === "running") {
+                group.probe = undefined
+                this.maybeProbe(group, generation)
+            }
+        }
         await Promise.all(pending)
     }
 
@@ -209,6 +264,15 @@ export class MediaOnTab {
         return this.state.frames[String(frameId)]
     }
 
+    /** A copy of the state with sensitive header values redacted (debug export). */
+    getStateSnapshot(): TabMediaState {
+        const copy = JSON.parse(JSON.stringify(this.state)) as TabMediaState
+        const redact = (headers: HeadersRecord) => redactHeaders(headers) ?? {}
+        Object.values(copy.entries).forEach(e => e.requestHeaders = redact(e.requestHeaders))
+        Object.values(copy.segmentGroups).forEach(g => g.headers = redact(g.headers))
+        return copy
+    }
+
     /** A frame's content script told us its URL; if the frame navigated, forget its old media. */
     async setFrameUrl(frameId: number, url: string) {
         const key = String(frameId)
@@ -222,9 +286,27 @@ export class MediaOnTab {
                     delete this.state.entries[entryUrl]
                 }
             }
+            for (const [groupKey, group] of Object.entries(this.state.segmentGroups)) {
+                if (group.frameId === frameId) {
+                    delete this.state.segmentGroups[groupKey]
+                }
+            }
+            delete this.state.frameDurations[key]
         }
         this.state.frames[key] = url
         await this.store.save(this.tabId, this.state)
+    }
+
+    /** Duration of the frame's main <video> (used for streams rebuilt from segments). */
+    async setFrameDuration(frameId: number, duration: number) {
+        if (!Number.isFinite(duration) || duration <= 0 || this.state.frameDurations[String(frameId)] === duration) {
+            return
+        }
+        this.state.frameDurations[String(frameId)] = duration
+        this.scheduleSave()
+        if (Object.values(this.state.segmentGroups).some(g => g.frameId === frameId)) {
+            await this.publish()
+        }
     }
 
     async process(mediaResult: InterceptedMediaResult) {
@@ -248,7 +330,118 @@ export class MediaOnTab {
             case "http":
                 await this.processHttp(mediaResult.url, target, mediaResult.responseHeaders, generation, mediaResult.viaScript ?? false)
                 break
+            case "segment":
+                await this.processSegment(mediaResult, target, generation)
+                break
         }
+    }
+
+    // ---------- segments ----------
+
+    private saveTimer: ReturnType<typeof setTimeout> | null = null
+
+    /** Segments arrive every few seconds: persist at most every 2 s. */
+    private scheduleSave() {
+        if (this.saveTimer !== null) {
+            return
+        }
+        this.saveTimer = setTimeout(() => {
+            this.saveTimer = null
+            if (!this.isClosed) {
+                this.store.save(this.tabId, this.state)
+            }
+        }, 2000)
+    }
+
+    private async processSegment(mediaResult: InterceptedMediaResult, target: Target, generation: number) {
+        const contentType = getContentType(mediaResult.responseHeaders)
+        // URLs the page appended to a MediaSource are segments even if their name doesn't say so
+        const parsed = SegmentUtils.parseSegment(mediaResult.url, contentType, mediaResult.rangeHeader)
+            ?? (mediaResult.mime ? SegmentUtils.parseSegment(mediaResult.url, "video/iso.segment", null) : null)
+        if (!parsed) {
+            return
+        }
+        let group = this.state.segmentGroups[parsed.groupKey]
+        const isNew = !group
+        if (!group) {
+            const url = new URL(mediaResult.url)
+            group = {
+                key: parsed.groupKey,
+                frameId: target.frameId,
+                base: url.origin + url.pathname.slice(0, url.pathname.lastIndexOf("/") + 1),
+                count: 0,
+                track: parsed.trackHint,
+                token: parsed.qualityToken,
+                height: parsed.height,
+                headers: target.headers,
+                sizes: [],
+            }
+            this.state.segmentGroups[parsed.groupKey] = group
+        }
+        const before = JSON.stringify([group.initUrl, group.track, group.mime, group.template !== undefined])
+        if (parsed.isInit) {
+            group.initUrl = mediaResult.url
+        } else if (parsed.number !== undefined && parsed.template) {
+            group.template = parsed.template // the latest URL (fresh query string, e.g. tokens)
+            group.pad = parsed.pad
+            group.min = group.min === undefined ? parsed.number : Math.min(group.min, parsed.number)
+            group.max = group.max === undefined ? parsed.number : Math.max(group.max, parsed.number)
+            group.count++
+            group.headers = target.headers
+        }
+        const size = getContentLength(mediaResult.responseHeaders)
+        if (size && group.sizes.length < 20 && !parsed.isInit) {
+            group.sizes.push(size)
+        }
+        if (mediaResult.mime) {
+            group.mime = mediaResult.mime
+        }
+        if (contentType && !contentType.includes("iso.segment") && !contentType.includes("octet-stream")) {
+            group.contentType = contentType
+        }
+        group.track = detectGroupTrack(group, parsed.trackHint)
+        this.scheduleSave()
+        const changed = isNew || before !== JSON.stringify([group.initUrl, group.track, group.mime, group.template !== undefined])
+        this.maybeProbe(group, generation)
+        if (changed && !this.isStale(generation)) {
+            await this.publish()
+        }
+    }
+
+    private runningProbes = 0
+
+    /** Work out the first and last segment number of a numbered group by probing the server. */
+    private maybeProbe(group: SegmentGroup, generation: number) {
+        if (group.probe || !group.template || group.max === undefined) {
+            return
+        }
+        // one segment alone could be anything; an init segment or a second segment makes it a stream
+        if (!group.initUrl && group.count < 2) {
+            return
+        }
+        if (hasManifestFor(group, this.state) || this.runningProbes >= 3) {
+            return
+        }
+        group.probe = {status: "running"}
+        this.runningProbes++
+        run(async () => {
+            try {
+                const result = await probeSegmentRange(group)
+                if (this.isStale(generation)) return
+                group.probe = result.last !== undefined
+                    ? {status: "done", first: result.first, last: result.last}
+                    : {status: "failed"}
+                result.sizes.forEach(s => group.sizes.length < 20 && group.sizes.push(s))
+            } catch (e) {
+                group.probe = {status: "failed"}
+            } finally {
+                this.runningProbes--
+            }
+            this.scheduleSave()
+            await this.publish()
+            // a group that waited because 3 probes were running
+            Object.values(this.state.segmentGroups).forEach(g => this.maybeProbe(g, generation))
+        })
     }
 
     private isStale(generation: number) {
@@ -375,6 +568,11 @@ export class MediaOnTab {
             extension: extension,
             duration: _.sumBy(playlist.segments, segment => segment.duration),
             encryption: HLSUtils.getMediaPlaylistEncryption(playlist),
+            segmentKeys: segmentKeysOf(
+                playlist.segments.slice(0, 300).flatMap(segment => [segment.uri, segment.map?.uri])
+                    .filter((uri): uri is string => !!uri)
+                    .map(uri => resolveUrl(uri, url)),
+            ),
         }
         await this.commit(generation, entry)
     }
@@ -396,7 +594,7 @@ export class MediaOnTab {
                 url: url,
                 frameId: target.frameId,
                 requestHeaders: target.headers,
-                ...parseMPDSummary(text),
+                ...parseMPDSummary(text, url),
             }
             await this.commit(generation, entry)
         } finally {
@@ -448,6 +646,215 @@ export class MediaOnTab {
 
 type Target = { frameId: number, headers: HeadersRecord }
 
+// ---------- segment groups ----------
+
+function detectGroupTrack(group: SegmentGroup, hint: SegmentTrack): SegmentTrack {
+    const fromType = (type: string | undefined): SegmentTrack | null => {
+        const t = type?.toLowerCase() ?? ""
+        if (t.startsWith("video/")) return "video"
+        if (t.startsWith("audio/")) return "audio"
+        return null
+    }
+    // the MSE SourceBuffer type is the most reliable. Servers often label every fMP4 segment "video/mp4", even
+    // audio ones, so after that: an audio/* response type, then the URL naming (a1 / v1 / audio ...), then video/*
+    const fromMime = fromType(group.mime)
+    if (fromMime) return fromMime
+    if (fromType(group.contentType) === "audio") return "audio"
+    if (hint !== "unknown") return hint
+    if (group.track !== "unknown") return group.track
+    return fromType(group.contentType) ?? "unknown"
+}
+
+function directoryOf(url: string): string | null {
+    try {
+        const u = new URL(url)
+        return u.origin + u.pathname.slice(0, u.pathname.lastIndexOf("/") + 1)
+    } catch (e) {
+        return null
+    }
+}
+
+/** Is this group part of a stream whose manifest (HLS/DASH) we captured? Then only the manifest is listed. */
+function hasManifestFor(group: SegmentGroup, state: TabMediaState): boolean {
+    for (const entry of Object.values(state.entries)) {
+        if (entry.kind !== "hls-master" && entry.kind !== "hls-media" && entry.kind !== "dash") continue
+        if ((entry.kind === "hls-media" || entry.kind === "dash") && entry.segmentKeys?.includes(group.key)) {
+            return true
+        }
+        if (entry.frameId === group.frameId) {
+            return true
+        }
+        const dir = directoryOf(entry.url)
+        if (dir && group.base.startsWith(dir)) {
+            return true
+        }
+    }
+    return false
+}
+
+/**
+ * First and last segment number of a numbered group, by probing the server with 1-byte range requests
+ * (exponential then binary search; at most 64 requests), using the page's request headers.
+ */
+async function probeSegmentRange(group: SegmentGroup): Promise<{ first?: number, last?: number, sizes: number[] }> {
+    const sizes: number[] = []
+    let requests = 0
+    const headers: HeadersRecord = {}
+    Object.entries(group.headers).forEach(([k, v]) => {
+        if (k.toLowerCase() !== "range") headers[k] = v
+    })
+    headers["Range"] = "bytes=0-0"
+    const exists = async (n: number): Promise<boolean> => {
+        if (n < 0 || requests >= 64) return false
+        requests++
+        const response = await fetchWithTimeout(
+            new Request(SegmentUtils.segmentUrl(group.template!, n, group.pad), {headers}), 10_000,
+        )
+        if (!response || !(response.status === 200 || response.status === 206)) return false
+        const total = /\/(\d+)\s*$/.exec(response.headers.get("Content-Range") ?? "")?.[1]
+        const size = total ? parseInt(total) : (response.status === 200 ? getContentLength(response.headers) : null)
+        if (size) sizes.push(size)
+        try {
+            await response.body?.cancel()
+        } catch (e) {
+            // ignore
+        }
+        return true
+    }
+    const min = group.min!, max = group.max!
+    if (!(await exists(max))) {
+        // the URL pattern doesn't work outside the player (e.g. per-segment signed URLs)
+        return {sizes}
+    }
+    let lo = max
+    let hi: number | undefined
+    for (let step = 1; hi === undefined && requests < 40; step *= 2) {
+        if (await exists(lo + step)) {
+            lo = lo + step
+        } else {
+            hi = lo + step
+        }
+    }
+    hi ??= lo + 1
+    while (hi - lo > 1 && requests < 64) {
+        const mid = Math.floor((lo + hi) / 2)
+        if (await exists(mid)) lo = mid
+        else hi = mid
+    }
+    // first: usually 0 or 1, otherwise the smallest number that exists below what the player fetched
+    let first = min
+    if (min > 0) {
+        if (await exists(0)) {
+            first = 0
+        } else if (min > 1 && await exists(1)) {
+            first = 1
+        } else if (min > 1) {
+            let a = 1, b = min
+            while (b - a > 1 && requests < 64) {
+                const mid = Math.floor((a + b) / 2)
+                if (await exists(mid)) b = mid
+                else a = mid
+            }
+            first = b
+        }
+    }
+    return {first, last: lo, sizes}
+}
+
+function trackJob(group: SegmentGroup): SegmentsTrackJob {
+    return {
+        init: group.initUrl,
+        template: group.template!,
+        first: group.probe?.first ?? group.min!,
+        last: group.probe?.last ?? group.max!,
+        pad: group.pad,
+    }
+}
+
+function segmentCount(job: SegmentsTrackJob) {
+    return job.last - job.first + 1
+}
+
+function estimatedSize(group: SegmentGroup, job: SegmentsTrackJob): number | undefined {
+    return group.sizes.length ? _.mean(group.sizes) * segmentCount(job) : undefined
+}
+
+/** One entry per frame for streams rebuilt from segments; video groups become its qualities (high to low). */
+function buildRebuiltStreams(
+    state: TabMediaState,
+    pageInfo: PageInfo,
+    add: (frameId: number, item: DownloadableMedia) => void,
+) {
+    const usable = Object.values(state.segmentGroups).filter(g =>
+        g.template && g.min !== undefined && g.max !== undefined
+        && g.probe && g.probe.status !== "running"
+        && !hasManifestFor(g, state)
+    )
+    for (const [frameKey, groups] of Object.entries(_.groupBy(usable, g => g.frameId))) {
+        const frameId = Number(frameKey)
+        const audioGroups = groups.filter(g => g.track === "audio")
+        let videoGroups = groups.filter(g => g.track !== "audio")
+        const audioOnly = videoGroups.length === 0
+        if (audioOnly) {
+            videoGroups = audioGroups
+        }
+        // separate audio track: pair the most complete audio group with every video quality
+        const audio = audioOnly ? undefined : _.maxBy(audioGroups, g => segmentCount(trackJob(g)))
+        const audioJob = audio ? trackJob(audio) : undefined
+        const sorted = _.orderBy(videoGroups, [g => g.height ?? 0, g => segmentCount(trackJob(g))], ["desc", "desc"])
+        const frameUrl = state.frames[String(frameId)]
+        const duration = state.frameDurations[String(frameId)]
+        const usedLabels = new Map<string, number>()
+        const qualities: DownloadableMediaQuality[] = sorted.map((group, index) => {
+            const job = trackJob(group)
+            let label = group.height ? `${group.height}p` : (group.token || `Quality ${index + 1}`)
+            const seen = usedLabels.get(label) ?? 0
+            usedLabels.set(label, seen + 1)
+            if (seen > 0) label = `${label} (${seen + 1})`
+            const extension = /\.ts(\?|$)/i.test(job.template) ? "ts" : "mp4"
+            const displayName = `${pageInfo.pageTitle} - ${label} (rebuilt)`
+            const size = [estimatedSize(group, job), audio && audioJob ? estimatedSize(audio, audioJob) : 0]
+                .reduce<number | undefined>((sum, s) => s === undefined || sum === undefined ? undefined : sum + s, 0)
+            const notes = [
+                group.probe?.status === "failed" ? "rebuilt from the segments seen so far" : "rebuilt from segments",
+                audioJob ? "video + audio" : undefined,
+            ].filter(Boolean)
+            return {
+                label: label,
+                uri: job.init ?? SegmentUtils.segmentUrl(job.template, job.first, job.pad),
+                requestHeaders: withReferer(group.headers, frameUrl),
+                displayName: displayName,
+                suggestedFullName: `${displayName}.${extension}`,
+                duration: duration ? createDurationString(duration) : undefined,
+                resolution: undefined,
+                size: size ? `~${createSizeString(Math.round(size))}` : undefined,
+                extension: extension,
+                note: `${notes.join(", ")} (${segmentCount(job)} segments)`,
+                segmentsJob: {
+                    video: job,
+                    audio: audioJob,
+                    headers: withReferer(group.headers, frameUrl),
+                },
+            }
+        })
+        if (!qualities.length) continue
+        const best = qualities[0]
+        add(frameId, {
+            type: "segments",
+            uri: best.uri,
+            requestHeaders: best.requestHeaders,
+            displayName: best.displayName,
+            suggestedFullName: best.suggestedFullName,
+            duration: best.duration,
+            size: best.size,
+            extension: best.extension,
+            note: best.note,
+            segmentsJob: best.segmentsJob,
+            qualities: qualities,
+        })
+    }
+}
+
 // ---------- building the lists shown to the user ----------
 
 type PageInfo = { pageTitle: string, pageUrlHash: string }
@@ -478,6 +885,8 @@ export function buildDownloadableMediaLists(state: TabMediaState, pageInfo: Page
         list.push(item)
     }
 
+    // a frame that fetches stream segments plays a stream: whole MP4s fetched by its scripts are its segments too
+    Object.values(state.segmentGroups).forEach(g => framesWithStreams.add(g.frameId))
     for (const entry of entries) {
         if (entry.kind === "hls-master" || entry.kind === "hls-media" || entry.kind === "dash") {
             framesWithStreams.add(entry.frameId)
@@ -554,6 +963,7 @@ export function buildDownloadableMediaLists(state: TabMediaState, pageInfo: Page
             })
         }
     }
+    buildRebuiltStreams(state, pageInfo, add)
     return result
 }
 
@@ -662,7 +1072,9 @@ const DRM_SYSTEM_IDS = [
 ]
 
 /** Small regex-based MPD summary (service workers have no DOMParser). */
-function parseMPDSummary(mpd: string): { duration?: number, maxHeight?: number, isDrm: boolean } {
+function parseMPDSummary(mpd: string, mpdUrl: string): {
+    duration?: number, maxHeight?: number, isDrm: boolean, segmentKeys: string[],
+} {
     const lower = mpd.toLowerCase()
     const isDrm = DRM_SYSTEM_IDS.some(id => lower.includes(id))
     let duration: number | undefined
@@ -673,7 +1085,35 @@ function parseMPDSummary(mpd: string): { duration?: number, maxHeight?: number, 
     }
     const heights = Array.from(mpd.matchAll(/\bheight\s*=\s*"(\d+)"/gi), m => parseInt(m[1]))
     const maxHeight = heights.length ? Math.max(...heights) : undefined
-    return {duration, maxHeight, isDrm}
+    return {duration, maxHeight, isDrm, segmentKeys: mpdSegmentKeys(mpd, mpdUrl)}
+}
+
+/** Group keys of the segments a DASH manifest describes (from SegmentTemplate media/initialization URLs). */
+function mpdSegmentKeys(mpd: string, mpdUrl: string): string[] {
+    const ids = Array.from(mpd.matchAll(/<Representation\b[^>]*\bid\s*=\s*"([^"]+)"/gi), m => m[1])
+    const templates = Array.from(mpd.matchAll(/\b(?:media|initialization)\s*=\s*"([^"]+)"/gi), m => m[1])
+    const baseUrl = /<BaseURL>\s*([^<]+?)\s*<\/BaseURL>/i.exec(mpd)?.[1]
+    const base = baseUrl ? resolveUrl(baseUrl, mpdUrl) : mpdUrl
+    const urls: string[] = []
+    for (const template of templates.slice(0, 50)) {
+        for (const id of (ids.length ? ids.slice(0, 20) : [""])) {
+            const sample = template
+                .replace(/\$RepresentationID\$/g, id)
+                .replace(/\$Number(?:%0(\d+)d)?\$/g, (_, width) => width ? "1".padStart(parseInt(width), "0") : "1")
+                .replace(/\$(?:Time|Bandwidth)(?:%0\d+d)?\$/g, "0")
+            urls.push(resolveUrl(sample, base))
+        }
+    }
+    return segmentKeysOf(urls)
+}
+
+function segmentKeysOf(urls: string[]): string[] {
+    const keys = new Set<string>()
+    for (const url of urls) {
+        const parsed = SegmentUtils.parseSegment(url, "video/iso.segment", null)
+        if (parsed) keys.add(parsed.groupKey)
+    }
+    return Array.from(keys)
 }
 
 function resolveUrl(uri: string, base: string) {

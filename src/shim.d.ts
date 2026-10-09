@@ -5,6 +5,7 @@ import {DownloadRequestHeaders, DownloadRequestItem} from "~/interfaces/Download
 import {DownloadableMedia} from "~/media/MediaOnTab";
 import type {Runtime} from "webextension-polyfill";
 import type {ReportedMedia} from "~/linkgrabber/DownloadLinkInterceptor";
+import type {PageDebugEvent} from "~/contentscripts/PageMediaReporter";
 
 declare module "webext-bridge" {
     export interface ProtocolMap {
@@ -21,6 +22,15 @@ declare module "webext-bridge" {
         get_platform: ProtocolWithReturn<undefined, Runtime.PlatformInfo>,
         // content script (any frame) -> background: this frame's URL and media it found itself
         // (page hook, Resource Timing, media elements); an empty list just announces the frame
-        report_frame_media: ProtocolWithReturn<{ frameUrl: string, items: ReportedMedia[] }, void>,
+        report_frame_media: ProtocolWithReturn<{
+            frameUrl: string,
+            items: ReportedMedia[],
+            // duration (s) of the frame's main <video>, if known
+            videoDuration?: number | null,
+            // debug mode: what the page hook / resource scan saw, for the detection log
+            debugEvents?: PageDebugEvent[],
+        }, void>,
+        // toolbar popup -> background: save the detection log of a tab (debug mode); true if a download started
+        export_detection_log: ProtocolWithReturn<{ tabId: number }, boolean>,
     }
 }

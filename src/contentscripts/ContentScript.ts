@@ -14,6 +14,9 @@ import {DefinedCommands} from "~/message/Commands";
 import {defineExtensionEntry} from "~/utils/DefineExtensionEntry";
 import ContentScriptEntryType from "~/utils/EntryPointTypes/ContentScript/ContentScriptEntryType";
 import {startPageMediaReporter} from "~/contentscripts/PageMediaReporter";
+import type {SegmentsTrackJob} from "~/media/MediaOnTab";
+import {segmentUrl} from "~/media/SegmentUtils";
+import _ from "lodash";
 
 const showPopupDelayed = debounce(500)
 
@@ -53,6 +56,31 @@ export default defineExtensionEntry()
                     alert(createAlertStringForMyExtension(
                         `${media.displayName ?? "This video"}: ${media.note ?? "not supported yet"}`
                     ))
+                    return
+                }
+                if (addDownloadType === "segments" && media.segmentsJob) {
+                    // a stream rebuilt from its numbered segments: send the app one job with every segment URL
+                    const job = media.segmentsJob
+                    const expand = (track: SegmentsTrackJob) => _.range(track.first, track.last + 1)
+                        .map(n => segmentUrl(track.template, n, track.pad))
+                    addDownloads([
+                        {
+                            link: media.uri,
+                            suggestedName: media.suggestedFullName ?? "",
+                            type: "segments",
+                            downloadPage: location.href,
+                            headers: job.headers,
+                            description: null,
+                            init: job.video.init ?? null,
+                            segments: expand(job.video),
+                            audioInit: job.audio?.init ?? null,
+                            audioSegments: job.audio ? expand(job.audio) : undefined,
+                        }
+                    ])
+                    MediaPopup.toggleList(false)
+                    return
+                }
+                if (addDownloadType !== "hls" && addDownloadType !== "http") {
                     return
                 }
                 addDownloads([
