@@ -89,7 +89,7 @@ export abstract class DownloadLinkInterceptor {
         requestHeaders: Headers,
         responseHeaders: Headers,
     ): InterceptedMediaResult | false {
-        // callers already checked HLSUtils.isHLSPlaylist (".m3u8" path or HLS Content-Type)
+        // callers already checked the URL/Content-Type (HLS or DASH) and set mediaType accordingly
         return {
             type: "media",
             mediaType: "hls",
@@ -327,11 +327,21 @@ export abstract class DownloadLinkInterceptor {
                 // or as "media" when the browser plays HLS natively)
                 if (HLSUtils.isHLSPlaylist(details.url, contentType)) {
                     // the request may have started before a service-worker restart; headers are optional for playlists
-                    this.checkForHLS(details, request?.finalRequest)
+                    this.checkForStreamManifest(details, request?.finalRequest, "hls")
                     return
                 }
-                if (details.type === "media" && request) {
-                    this.checkForDirectMedia(details, request.finalRequest)
+                if (HLSUtils.isDASHManifest(details.url, contentType)) {
+                    this.checkForStreamManifest(details, request?.finalRequest, "dash")
+                    return
+                }
+                if (!request) {
+                    return
+                }
+                if (details.type === "media") {
+                    this.checkForDirectMedia(details, request.finalRequest, false)
+                } else if (isWholeMediaFileFromScript(details.statusCode, contentType)) {
+                    // MP4/audio files loaded by a script (XHR/fetch), e.g. players that fetch then play a blob:
+                    this.checkForDirectMedia(details, request.finalRequest, true)
                 }
             },
             {
@@ -526,33 +536,48 @@ export abstract class DownloadLinkInterceptor {
     }
 
     /**
-     * Playlists a page already loaded before this extension instance was listening (e.g. after the
-     * extension was reloaded/updated), reported by its content script. No request headers are known.
+     * Media a frame's content script found itself: playlists seen by the page hook (fetch/XHR bodies starting
+     * with #EXTM3U, incl. blob: playlists), and resources/media elements the page already loaded (e.g. before
+     * this extension instance was listening, or from cache). We didn't see these requests, so no headers.
      */
-    onPlaylistsReportedByPage(tabId: number, pageUrl: string | null, urls: string[]) {
+    onMediaReportedByFrame(
+        tabId: number,
+        frameId: number,
+        frameUrl: string,
+        pageUrl: string | null,
+        items: ReportedMedia[],
+    ) {
         if (!Configs.getLatestConfig().popupEnabled) {
             return
         }
-        if (pageUrl && (this.isInConfigBlacklist(pageUrl) || this.isInMediaBlackList(pageUrl))) {
-            return
+        for (const pageOrFrame of [pageUrl, frameUrl]) {
+            if (pageOrFrame && (this.isInConfigBlacklist(pageOrFrame) || this.isInMediaBlackList(pageOrFrame))) {
+                return
+            }
         }
-        for (const url of urls) {
-            if (this.isInConfigBlacklist(url) || this.isInMediaBlackList(url)) {
+        for (const item of items) {
+            if (!/^(https?|blob):/i.test(item.url)) {
+                continue
+            }
+            if (this.isInConfigBlacklist(item.url) || this.isInMediaBlackList(item.url)) {
                 continue
             }
             this.onMediaDetected(tabId, {
                 type: "media",
-                mediaType: "hls",
-                url: url,
+                mediaType: item.kind,
+                url: item.url,
                 requestHeaders: new Headers(),
                 responseHeaders: new Headers(),
+                frameId: frameId,
+                frameUrl: frameUrl,
+                content: item.content ?? undefined,
             })
         }
     }
 
-    onMediaDetected(tabId: number, mediaResult: InterceptedMediaResult) {
+    onMediaDetected(tabId: number, mediaResult: InterceptedMediaResult, initiator?: string) {
         this.onMediaDetectedListener?.onMediaDetected(
-            tabId, mediaResult,
+            tabId, mediaResult, initiator,
         )
     }
 
@@ -623,19 +648,24 @@ export abstract class DownloadLinkInterceptor {
         this.onMediaDetectedListener = onMediaDetectedListener
     }
 
-    private checkForHLS(details: WebRequest.OnResponseStartedDetailsType, request: WebRequest.OnSendHeadersDetailsType | undefined) {
+    private checkForStreamManifest(
+        details: WebRequest.OnResponseStartedDetailsType,
+        request: WebRequest.OnSendHeadersDetailsType | undefined,
+        kind: "hls" | "dash",
+    ) {
         if (!this.shouldProcessMedia(details, true)) {
             return
         }
-        const isHLS = this.isHLSRequest(
+        const result = this.isHLSRequest(
             details.url,
             getHeaders(request?.requestHeaders),
             getHeaders(details.responseHeaders),
         );
-        if (isHLS) {
+        if (result) {
             this.onMediaDetected(
                 details.tabId,
-                isHLS,
+                {...result, mediaType: kind, ...frameInfo(details)},
+                getInitiator(details),
             )
         }
     }
@@ -674,7 +704,11 @@ export abstract class DownloadLinkInterceptor {
         return true
     }
 
-    private checkForDirectMedia(details: WebRequest.OnResponseStartedDetailsType, request: WebRequest.OnSendHeadersDetailsType) {
+    private checkForDirectMedia(
+        details: WebRequest.OnResponseStartedDetailsType,
+        request: WebRequest.OnSendHeadersDetailsType,
+        viaScript: boolean,
+    ) {
         if (!this.shouldProcessMedia(details, false)) {
             return
         }
@@ -686,7 +720,8 @@ export abstract class DownloadLinkInterceptor {
         if (isMedia) {
             this.onMediaDetected(
                 details.tabId,
-                isMedia,
+                {...isMedia, viaScript: viaScript, ...frameInfo(details)},
+                getInitiator(details),
             )
         }
     }
@@ -709,6 +744,44 @@ export abstract class DownloadLinkInterceptor {
         tabInfo.url = tab.url
         tabInfo.title = tab.title
     }
+}
+
+/** Media a content script reports (see onMediaReportedByFrame) */
+export type ReportedMedia = {
+    url: string,
+    kind: "hls" | "dash" | "http",
+    content?: string | null,
+}
+
+type RequestDetailsWithFrame = WebRequest.OnResponseStartedDetailsType & {
+    initiator?: string, // chrome
+    documentUrl?: string, // firefox
+}
+
+function frameInfo(details: RequestDetailsWithFrame): { frameId: number, frameUrl?: string } {
+    return {
+        frameId: details.frameId,
+        frameUrl: details.documentUrl,
+    }
+}
+
+function getInitiator(details: RequestDetailsWithFrame): string | undefined {
+    return details.initiator ?? details.originUrl ?? details.documentUrl
+}
+
+/**
+ * A full (200) video/audio response to XHR/fetch. MPEG-TS (video/mp2t) is excluded: those are stream
+ * segments, and so are 206 range responses.
+ */
+function isWholeMediaFileFromScript(statusCode: number, contentType: string | null): boolean {
+    if (statusCode !== 200 || !contentType) {
+        return false
+    }
+    const type = contentType.toLowerCase()
+    if (!(type.startsWith("video/") || type.startsWith("audio/"))) {
+        return false
+    }
+    return !type.startsWith("video/mp2t") && !HLSUtils.isHLSContentType(type)
 }
 
 function getHeaders(responseHeaders?: browser.WebRequest.HttpHeaders): Headers {

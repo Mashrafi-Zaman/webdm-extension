@@ -51,19 +51,23 @@ function receiveMessageFromContentScripts(
         await whenBackgroundReady()
         return await platformInfoProvider.getPlatformInfo()
     })
-    onMessage(DefinedCommands.REPORT_PAGE_PLAYLISTS, async (msg) => {
+    onMessage(DefinedCommands.REPORT_FRAME_MEDIA, async (msg) => {
         await whenBackgroundReady()
         const tabId = msg.sender.tabId
-        if (typeof tabId !== "number" || tabId < 0) {
+        // webext-bridge leaves out the frame id of the top frame
+        const frameId = msg.sender.frameId ?? 0
+        if (!Number.isInteger(tabId) || tabId < 0 || !Number.isInteger(frameId)) {
             return
         }
+        const {frameUrl, items} = msg.data
         let pageUrl: string | null = null
         try {
             pageUrl = (await browser.tabs.get(tabId)).url ?? null
         } catch (e) {
             // tab is gone
         }
-        interceptor.onPlaylistsReportedByPage(tabId, pageUrl, msg.data)
+        await mediaRegistry.onFrameReported(tabId, frameId, frameUrl)
+        interceptor.onMediaReportedByFrame(tabId, frameId, frameUrl, pageUrl, items)
         // also re-send what we already know for this tab (restored from storage.session)
         await mediaRegistry.publish(tabId)
     })

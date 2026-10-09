@@ -13,6 +13,7 @@ import {addDownloads} from "~/contentscripts/AddDownloads";
 import {DefinedCommands} from "~/message/Commands";
 import {defineExtensionEntry} from "~/utils/DefineExtensionEntry";
 import ContentScriptEntryType from "~/utils/EntryPointTypes/ContentScript/ContentScriptEntryType";
+import {startPageMediaReporter} from "~/contentscripts/PageMediaReporter";
 
 const showPopupDelayed = debounce(500)
 
@@ -28,34 +29,6 @@ async function checkAndReportLinks() {
         return
     }
     await addDownloads(downloadItems)
-}
-
-/**
- * If this script started after the page's player already fetched its playlists (the extension was
- * installed/reloaded/updated while the page was open), the background never saw those requests.
- * Report the .m3u8 URLs from Resource Timing so the background can process them, and so it re-sends
- * whatever media it already knows for this tab.
- */
-function reportPlaylistsAlreadyLoaded() {
-    run(async () => {
-        try {
-            const urls = new Set<string>()
-            for (const entry of performance.getEntriesByType("resource")) {
-                try {
-                    const url = new URL(entry.name)
-                    if ((url.protocol === "http:" || url.protocol === "https:")
-                        && url.pathname.toLowerCase().endsWith(".m3u8")) {
-                        urls.add(url.toString())
-                    }
-                } catch (e) {
-                    // not a URL
-                }
-            }
-            await sendMessage(DefinedCommands.REPORT_PAGE_PLAYLISTS, Array.from(urls), "background")
-        } catch (e) {
-            // background not reachable
-        }
-    })
 }
 
 let lastSelectionConsumed = true
@@ -75,6 +48,13 @@ export default defineExtensionEntry()
             })
             MediaPopup.setItemClickListener((media) => {
                 const addDownloadType = media.type
+                if (media.downloadable === false || addDownloadType === "dash") {
+                    // e.g. DASH: listed so the user knows it's there, but the app can't download it yet
+                    alert(createAlertStringForMyExtension(
+                        `${media.displayName ?? "This video"}: ${media.note ?? "not supported yet"}`
+                    ))
+                    return
+                }
                 addDownloads([
                     {
                         link: media.uri,
@@ -147,7 +127,7 @@ export default defineExtensionEntry()
             onMessage(DefinedCommands.DOWNLOADABLE_MEDIA_DETECTED, (msg) => {
                 MediaPopup.updatePopup(msg.data)
             })
-            reportPlaylistsAlreadyLoaded()
+            startPageMediaReporter()
         } catch (e) {
             console.log("failed to load WebDM Integration content script", e)
             throw e

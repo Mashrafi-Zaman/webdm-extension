@@ -7,10 +7,15 @@ import * as HLSUtils from "~/media/HLSUtils"
 import {DefinedCommands} from "~/message/Commands";
 import {TabMediaStore} from "~/media/TabMediaStore";
 
+type FrameRef = { tabId: number, frameId: number }
+
 export class MediaRegistry implements OnMediaInterceptedFromRequestListener {
     // a promise so concurrent detections for one tab share a single restore from storage
     private readonly tabs = new Map<number, Promise<MediaOnTab>>()
     private readonly store = new TabMediaStore()
+    // origin -> frames showing a document of that origin (from content-script reports); used to attribute
+    // requests made by a page's service worker, which have no tab (tabId -1)
+    private readonly framesByOrigin = new Map<string, FrameRef[]>()
 
     constructor() {
         HLSUtils.parseHLSSilently()
@@ -21,8 +26,8 @@ export class MediaRegistry implements OnMediaInterceptedFromRequestListener {
         if (!result) {
             result = (async () => {
                 const mediaOnTab = new MediaOnTab(tabId, {
-                    onListUpdated(list: DownloadableMedia[]) {
-                        onDownloadableMediaProcessed(tabId, list)
+                    onListUpdated(frameId: number, list: DownloadableMedia[]) {
+                        onDownloadableMediaProcessed(tabId, frameId, list)
                     }
                 }, this.store)
                 await mediaOnTab.restore()
@@ -41,6 +46,7 @@ export class MediaRegistry implements OnMediaInterceptedFromRequestListener {
                 this.tabs.delete(tabId)
                 page?.then(p => p.close())
                 this.store.clear(tabId)
+                this.forgetFrames(ref => ref.tabId === tabId)
             }
         )
         browser.tabs.onUpdated.addListener(
@@ -49,20 +55,74 @@ export class MediaRegistry implements OnMediaInterceptedFromRequestListener {
                     // new page: forget media of the previous one (in memory and in storage)
                     this.tabs.get(tabId)?.then(p => p.reset())
                     this.store.clear(tabId)
+                    this.forgetFrames(ref => ref.tabId === tabId)
                 }
             }
         )
     }
 
-    async onMediaDetected(tabId: number, mediaResult: InterceptedMediaResult) {
+    private forgetFrames(predicate: (ref: FrameRef) => boolean) {
+        for (const [origin, refs] of this.framesByOrigin) {
+            const kept = refs.filter(ref => !predicate(ref))
+            if (kept.length) {
+                this.framesByOrigin.set(origin, kept)
+            } else {
+                this.framesByOrigin.delete(origin)
+            }
+        }
+    }
+
+    /** A content script (in any frame) started or re-announced itself. */
+    async onFrameReported(tabId: number, frameId: number, frameUrl: string) {
         if (tabId < 0) {
             return
+        }
+        const origin = originOf(frameUrl)
+        if (origin) {
+            this.forgetFrames(ref => ref.tabId === tabId && ref.frameId === frameId)
+            this.framesByOrigin.set(origin, [...(this.framesByOrigin.get(origin) ?? []), {tabId, frameId}])
+        }
+        const mediaOnTab = await this.getMediaOnTab(tabId)
+        await mediaOnTab.setFrameUrl(frameId, frameUrl)
+    }
+
+    async onMediaDetected(tabId: number, mediaResult: InterceptedMediaResult, initiator?: string) {
+        if (tabId < 0) {
+            const ref = await this.attributeToFrame(initiator)
+            if (!ref) {
+                return
+            }
+            tabId = ref.tabId
+            mediaResult = {...mediaResult, frameId: ref.frameId}
         }
         const mediaOnTab = await this.getMediaOnTab(tabId)
         await mediaOnTab.process(mediaResult)
     }
 
-    /** Re-send the tab's current list (e.g. when a content script (re)starts). */
+    /**
+     * Requests from a page's service worker have tabId -1. Attribute them by their initiator (the origin of the
+     * page that registered the worker): a frame of that origin we know about, else a tab showing that origin.
+     */
+    private async attributeToFrame(initiator: string | undefined): Promise<FrameRef | null> {
+        const origin = initiator ? originOf(initiator) : null
+        if (!origin) {
+            return null
+        }
+        const known = this.framesByOrigin.get(origin)
+        if (known?.length) {
+            return known[known.length - 1] // most recently reported
+        }
+        try {
+            const tabs = (await browser.tabs.query({}))
+                .filter(tab => tab.id !== undefined && tab.url && originOf(tab.url) === origin)
+            const tab = tabs.find(t => t.active) ?? (tabs.length === 1 ? tabs[0] : undefined)
+            return tab?.id !== undefined ? {tabId: tab.id, frameId: 0} : null
+        } catch (e) {
+            return null
+        }
+    }
+
+    /** Re-send the tab's current lists (e.g. when a content script (re)starts). */
     async publish(tabId: number) {
         if (tabId < 0) {
             return
@@ -70,10 +130,27 @@ export class MediaRegistry implements OnMediaInterceptedFromRequestListener {
         const mediaOnTab = await this.getMediaOnTab(tabId)
         await mediaOnTab.publish()
     }
+
+    async getFrameUrl(tabId: number, frameId: number): Promise<string | undefined> {
+        if (tabId < 0) {
+            return undefined
+        }
+        return (await this.getMediaOnTab(tabId)).getFrameUrl(frameId)
+    }
+}
+
+function originOf(url: string): string | null {
+    try {
+        const origin = new URL(url).origin
+        return origin && origin !== "null" ? origin : null
+    } catch (e) {
+        return null
+    }
 }
 
 async function onDownloadableMediaProcessed(
     tabId: number,
+    frameId: number,
     downloadableMedia: DownloadableMedia[],
 ) {
     try {
@@ -82,10 +159,11 @@ async function onDownloadableMediaProcessed(
             downloadableMedia,
             {
                 tabId: tabId,
+                frameId: frameId,
                 context: "content-script"
             }
         )
     } catch (e) {
-        console.debug("[webdm] media list not delivered to tab", tabId, e)
+        console.debug("[webdm] media list not delivered to frame", tabId, frameId, e)
     }
 }

@@ -10,5 +10,5 @@ export const DefinedCommands = Object.freeze({
     SET_HOLDING_KEY: "set_holding_key",
     GET_PLATFORM: "get_platform",
     DOWNLOADABLE_MEDIA_DETECTED: "downloadable_media_detected",
-    REPORT_PAGE_PLAYLISTS: "report_page_playlists",
+    REPORT_FRAME_MEDIA: "report_frame_media",
 })

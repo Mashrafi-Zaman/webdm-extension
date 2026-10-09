@@ -4,6 +4,7 @@ import {inRange} from "~/utils/NumberUtils";
 import {run} from "~/utils/ScopeFunctions";
 import {MasterPlaylist, MediaPlaylist} from "hls-parser/types";
 import * as HLSUtils from "~/media/HLSUtils";
+import {HLSEncryption} from "~/media/HLSUtils";
 import * as MultiMediaUtils from "~/media/MultiMediaUtils"
 import _ from "lodash";
 import HLS from "hls-parser"
@@ -16,13 +17,18 @@ import {TabMediaStore} from "~/media/TabMediaStore";
 
 type HeadersRecord = Record<string, string>
 
-type HttpMediaEntry = {
-    kind: "http",
+type BaseEntry = {
     url: string,
     requestHeaders: HeadersRecord,
+    frameId: number, // frame whose content script shows this item
+}
+
+type HttpMediaEntry = BaseEntry & {
+    kind: "http",
     name?: string,
     extension: string,
     size?: number,
+    viaScript?: boolean, // fetched by XHR/fetch, not by a media element
 }
 
 export type HLSVariantInfo = {
@@ -33,33 +39,40 @@ export type HLSVariantInfo = {
     frameRate?: number,
 }
 
-type HLSMasterEntry = {
+type HLSMasterEntry = BaseEntry & {
     kind: "hls-master",
-    url: string,
-    requestHeaders: HeadersRecord,
     // null = the master's content is not known (yet / any more) and must be fetched
     variants: HLSVariantInfo[] | null,
-    isEncrypted?: boolean,
+    encryption?: HLSEncryption,
 }
 
-type HLSMediaPlaylistEntry = {
+type HLSSegmentFormat = "ts" | "fmp4" | "unsupported"
+
+type HLSMediaPlaylistEntry = BaseEntry & {
     kind: "hls-media",
-    url: string,
-    requestHeaders: HeadersRecord,
-    extension?: string,
+    format: HLSSegmentFormat,
+    extension?: string, // of the downloaded file: ts / mp4 / aac ...
     duration?: number,
-    isEncrypted?: boolean,
-    isSupported: boolean,
+    encryption: HLSEncryption,
 }
 
-type MediaEntry = HttpMediaEntry | HLSMasterEntry | HLSMediaPlaylistEntry
+type DASHEntry = BaseEntry & {
+    kind: "dash",
+    duration?: number,
+    maxHeight?: number,
+    isDrm: boolean,
+}
+
+type MediaEntry = HttpMediaEntry | HLSMasterEntry | HLSMediaPlaylistEntry | DASHEntry
 
 export type TabMediaState = {
     entries: Record<string, MediaEntry>,
+    // frameId -> URL of the document in that frame (as reported by its content script / requests)
+    frames: Record<string, string>,
 }
 
 export function emptyTabMediaState(): TabMediaState {
-    return {entries: {}}
+    return {entries: {}, frames: {}}
 }
 
 // ---------- what the content script receives ----------
@@ -74,6 +87,7 @@ export type DownloadableMediaQuality = {
     bandwidth?: string,
     resolution?: string,
     extension?: string,
+    note?: string,
 }
 
 export type DownloadableMedia = {
@@ -87,12 +101,17 @@ export type DownloadableMedia = {
     resolution?: string,
     extension?: string,
     size?: string,
+    // extra info shown in the list, e.g. "encrypted (supported)"
+    note?: string,
+    // false: listed for information only (e.g. DASH until the app supports it)
+    downloadable?: boolean,
     // for HLS master playlists: one entry per video, best quality first (uri/displayName above = qualities[0])
     qualities?: DownloadableMediaQuality[],
 }
 
 export interface OnMedialListUpdated {
-    onListUpdated(list: DownloadableMedia[]): void;
+    // called once per frame that has (or had) media
+    onListUpdated(frameId: number, list: DownloadableMedia[]): void;
 }
 
 function headersToRecord(headers: Headers): HeadersRecord {
@@ -103,15 +122,44 @@ function headersToRecord(headers: Headers): HeadersRecord {
     return record
 }
 
+function withReferer(headers: HeadersRecord, frameUrl: string | undefined): HeadersRecord {
+    // the app sends these headers when downloading; players inside iframes are often only served
+    // when the request comes "from" the iframe's page
+    if (!frameUrl || !/^https?:/i.test(frameUrl)) {
+        return headers
+    }
+    const refererKey = Object.keys(headers).find(k => k.toLowerCase() === "referer")
+    if (refererKey) {
+        // browsers usually send only the origin to other sites (strict-origin-when-cross-origin);
+        // upgrade that to the full frame URL, but keep a referer that points somewhere else
+        if (!isOriginOnlyRefererOf(headers[refererKey], frameUrl)) {
+            return headers
+        }
+        const {[refererKey]: _, ...rest} = headers
+        return {...rest, "Referer": frameUrl}
+    }
+    return {...headers, "Referer": frameUrl}
+}
+
+function isOriginOnlyRefererOf(referer: string, frameUrl: string) {
+    try {
+        const origin = new URL(frameUrl).origin
+        return referer === origin || referer === origin + "/"
+    } catch (e) {
+        return false
+    }
+}
+
 /**
- * Detected media of one tab. State is persisted in [TabMediaStore] (storage.session) so it survives
- * MV3 service-worker restarts; it's cleared when the tab navigates or closes.
+ * Detected media of one tab, grouped by frame. State is persisted in [TabMediaStore] (storage.session) so it
+ * survives MV3 service-worker restarts; it's cleared when the tab navigates or closes.
  */
 export class MediaOnTab {
     private state: TabMediaState = emptyTabMediaState()
     private generation = 0 // bumped on reset, so results of an old page are dropped
     private readonly inFlight = new Set<string>()
     private readonly failed = new Set<string>()
+    private readonly publishedFrames = new Set<number>()
     private isClosed = false
 
     public constructor(
@@ -123,19 +171,21 @@ export class MediaOnTab {
 
     /** Load persisted state, then finish any HLS work that was interrupted (e.g. by a service-worker restart). */
     async restore() {
-        this.state = await this.store.load(this.tabId) ?? emptyTabMediaState()
+        const stored = await this.store.load(this.tabId)
+        this.state = {...emptyTabMediaState(), ...stored}
         const generation = this.generation
         const pending: Promise<void>[] = []
         for (const entry of Object.values(this.state.entries)) {
             if (entry.kind !== "hls-master") continue
+            const target = {frameId: entry.frameId, headers: entry.requestHeaders}
             if (entry.variants === null) {
                 // master playlist data was lost: fetch it again
-                pending.push(this.processHLS(entry.url, entry.requestHeaders, generation))
+                pending.push(this.processHLS(entry.url, target, generation, undefined))
                 continue
             }
             for (const variant of entry.variants) {
                 if (!this.state.entries[variant.url]) {
-                    pending.push(this.processHLS(variant.url, entry.requestHeaders, generation))
+                    pending.push(this.processHLS(variant.url, target, generation, undefined))
                 }
             }
         }
@@ -152,16 +202,51 @@ export class MediaOnTab {
         this.state = emptyTabMediaState()
         this.inFlight.clear()
         this.failed.clear()
+        this.publishedFrames.clear()
+    }
+
+    getFrameUrl(frameId: number): string | undefined {
+        return this.state.frames[String(frameId)]
+    }
+
+    /** A frame's content script told us its URL; if the frame navigated, forget its old media. */
+    async setFrameUrl(frameId: number, url: string) {
+        const key = String(frameId)
+        const old = this.state.frames[key]
+        if (old === url) {
+            return
+        }
+        if (old !== undefined) {
+            for (const [entryUrl, entry] of Object.entries(this.state.entries)) {
+                if (entry.frameId === frameId) {
+                    delete this.state.entries[entryUrl]
+                }
+            }
+        }
+        this.state.frames[key] = url
+        await this.store.save(this.tabId, this.state)
     }
 
     async process(mediaResult: InterceptedMediaResult) {
         const generation = this.generation
+        const frameId = mediaResult.frameId !== undefined && mediaResult.frameId >= 0 ? mediaResult.frameId : 0
+        if (mediaResult.frameUrl && !this.state.frames[String(frameId)]) {
+            this.state.frames[String(frameId)] = mediaResult.frameUrl
+        }
+        const frameUrl = this.getFrameUrl(frameId) ?? mediaResult.frameUrl
+        const target = {
+            frameId: frameId,
+            headers: withReferer(headersToRecord(mediaResult.requestHeaders), frameUrl),
+        }
         switch (mediaResult.mediaType) {
             case "hls":
-                await this.processHLS(mediaResult.url, headersToRecord(mediaResult.requestHeaders), generation)
+                await this.processHLS(mediaResult.url, target, generation, mediaResult.content)
+                break
+            case "dash":
+                await this.processDASH(mediaResult.url, target, generation, mediaResult.content)
                 break
             case "http":
-                await this.processHttp(mediaResult.url, mediaResult.requestHeaders, mediaResult.responseHeaders, generation)
+                await this.processHttp(mediaResult.url, target, mediaResult.responseHeaders, generation, mediaResult.viaScript ?? false)
                 break
         }
     }
@@ -171,45 +256,57 @@ export class MediaOnTab {
     }
 
     private async processHttp(
-        url: string, requestHeaders: Headers, responseHeaders: Headers, generation: number,
+        url: string, target: Target, responseHeaders: Headers, generation: number, viaScript: boolean,
     ) {
-        if (this.state.entries[url]) {
+        if (this.state.entries[url] || this.inFlight.has(url)) {
             return
         }
-        let filenameWithExtension: string | null = null;
-        let extension: string | null = null;
-        const contentDisposition = getContentDisposition(responseHeaders);
-        if (contentDisposition) {
-            filenameWithExtension = getFileNameFromHeader(contentDisposition)
-        }
-        if (!filenameWithExtension) {
-            filenameWithExtension = getFileFromUrl(url)
-        }
-        if (filenameWithExtension) {
-            extension = getFileExtension(filenameWithExtension)
-        }
-        if (!extension) {
-            const contentType = getContentType(responseHeaders)
-            if (contentType) {
-                extension = MultiMediaUtils.getExtensionFromContentType(contentType)
+        this.inFlight.add(url)
+        try {
+            if (!hasAnyHeader(responseHeaders)) {
+                // reported by the page (media element / resource timing): we didn't see the response
+                responseHeaders = await fetchHeadersOnly(url, target.headers) ?? responseHeaders
+                if (this.isStale(generation)) return
             }
+            let filenameWithExtension: string | null = null;
+            let extension: string | null = null;
+            const contentDisposition = getContentDisposition(responseHeaders);
+            if (contentDisposition) {
+                filenameWithExtension = getFileNameFromHeader(contentDisposition)
+            }
+            if (!filenameWithExtension) {
+                filenameWithExtension = getFileFromUrl(url)
+            }
+            if (filenameWithExtension) {
+                extension = getFileExtension(filenameWithExtension)
+            }
+            if (!extension) {
+                const contentType = getContentType(responseHeaders)
+                if (contentType) {
+                    extension = MultiMediaUtils.getExtensionFromContentType(contentType)
+                }
+            }
+            if (!extension) {
+                // no extension ignore it
+                return
+            }
+            const entry: HttpMediaEntry = {
+                kind: "http",
+                url: url,
+                frameId: target.frameId,
+                requestHeaders: target.headers,
+                extension: extension,
+                name: filenameWithExtension ? getFileNameWithoutExtension(filenameWithExtension) : undefined,
+                size: getContentLength(responseHeaders) ?? undefined,
+                viaScript: viaScript || undefined,
+            }
+            await this.commit(generation, entry)
+        } finally {
+            this.inFlight.delete(url)
         }
-        if (!extension) {
-            // no extension ignore it
-            return
-        }
-        const entry: HttpMediaEntry = {
-            kind: "http",
-            url: url,
-            requestHeaders: headersToRecord(requestHeaders),
-            extension: extension,
-            name: filenameWithExtension ? getFileNameWithoutExtension(filenameWithExtension) : undefined,
-            size: getContentLength(responseHeaders) ?? undefined,
-        }
-        await this.commit(generation, entry)
     }
 
-    private async processHLS(url: string, requestHeaders: HeadersRecord, generation: number): Promise<void> {
+    private async processHLS(url: string, target: Target, generation: number, content: string | undefined): Promise<void> {
         const existing = this.state.entries[url]
         if (existing && !(existing.kind === "hls-master" && existing.variants === null)) {
             return // already known
@@ -219,24 +316,24 @@ export class MediaOnTab {
         }
         this.inFlight.add(url)
         try {
-            const content = await fetchHLSText(url, requestHeaders)
+            const text = content ?? await fetchPlaylistText(url, target.headers, "hls")
             if (this.isStale(generation)) return
-            const playlist = content === null ? null : parseHLS(content)
+            const playlist = text === null ? null : parseHLS(text)
             if (playlist === null) {
                 this.failed.add(url)
                 return
             }
             if (playlist.isMasterPlaylist) {
-                await this.onMasterPlaylist(url, requestHeaders, playlist, generation)
+                await this.onMasterPlaylist(url, target, playlist, generation)
             } else {
-                await this.onMediaPlaylist(url, requestHeaders, playlist, generation)
+                await this.onMediaPlaylist(url, target, playlist, generation)
             }
         } finally {
             this.inFlight.delete(url)
         }
     }
 
-    private async onMasterPlaylist(url: string, requestHeaders: HeadersRecord, playlist: MasterPlaylist, generation: number) {
+    private async onMasterPlaylist(url: string, target: Target, playlist: MasterPlaylist, generation: number) {
         const variants: HLSVariantInfo[] = _.uniqBy(
             playlist.variants.map((variant) => ({
                 // variant URIs are usually relative to the master playlist; store them absolute
@@ -251,34 +348,60 @@ export class MediaOnTab {
         const entry: HLSMasterEntry = {
             kind: "hls-master",
             url: url,
-            requestHeaders: requestHeaders,
+            frameId: target.frameId,
+            requestHeaders: target.headers,
             variants: variants,
-            isEncrypted: HLSUtils.isPlayListEncrypted(playlist),
+            encryption: HLSUtils.getMasterPlaylistEncryption(playlist),
         }
         await this.commit(generation, entry)
-        if (entry.isEncrypted) {
+        if (entry.encryption === "drm") {
             return
         }
-        // fetch each variant (media playlist) to learn duration / segment type / encryption
-        await Promise.all(variants.map(v => this.processHLS(v.url, requestHeaders, generation)))
+        // fetch each variant (media playlist) to learn duration / segment format / encryption
+        await Promise.all(variants.map(v => this.processHLS(v.url, target, generation, undefined)))
     }
 
-    private async onMediaPlaylist(url: string, requestHeaders: HeadersRecord, playlist: MediaPlaylist, generation: number) {
+    private async onMediaPlaylist(url: string, target: Target, playlist: MediaPlaylist, generation: number) {
         if (playlist.segments.length == 0) {
             return // empty list?
         }
-        const filename = getFileFromUrl(resolveUrl(playlist.segments[0].uri, url))
-        const extension = filename ? getFileExtension(filename) : undefined
+        const {format, extension} = getSegmentFormat(playlist, url)
         const entry: HLSMediaPlaylistEntry = {
             kind: "hls-media",
             url: url,
-            requestHeaders: requestHeaders,
-            extension: extension ?? undefined,
+            frameId: target.frameId,
+            requestHeaders: target.headers,
+            format: format,
+            extension: extension,
             duration: _.sumBy(playlist.segments, segment => segment.duration),
-            isEncrypted: HLSUtils.isMediaPlayListEncrypted(playlist),
-            isSupported: extension === "ts", // we only support ts files for now
+            encryption: HLSUtils.getMediaPlaylistEncryption(playlist),
         }
         await this.commit(generation, entry)
+    }
+
+    private async processDASH(url: string, target: Target, generation: number, content: string | undefined) {
+        if (this.state.entries[url] || this.inFlight.has(url) || this.failed.has(url)) {
+            return
+        }
+        this.inFlight.add(url)
+        try {
+            const text = content ?? await fetchPlaylistText(url, target.headers, "dash")
+            if (this.isStale(generation)) return
+            if (text === null || !/<MPD[\s>]/.test(text)) {
+                this.failed.add(url)
+                return
+            }
+            const entry: DASHEntry = {
+                kind: "dash",
+                url: url,
+                frameId: target.frameId,
+                requestHeaders: target.headers,
+                ...parseMPDSummary(text),
+            }
+            await this.commit(generation, entry)
+        } finally {
+            this.inFlight.delete(url)
+        }
     }
 
     private async commit(generation: number, entry: MediaEntry) {
@@ -290,7 +413,7 @@ export class MediaOnTab {
         await this.publish()
     }
 
-    /** Send the current list to the tab's content script. */
+    /** Send each frame its current list (a frame that no longer has media gets an empty list). */
     async publish() {
         if (this.isClosed) {
             return
@@ -301,9 +424,17 @@ export class MediaOnTab {
         if (!tabTitle || !tabUrl) {
             return
         }
-        this.onMediaListUpdated.onListUpdated(
-            buildDownloadableMediaList(this.state, {pageTitle: tabTitle, pageUrlHash: shortSafeHash(tabUrl, 6)})
-        )
+        const lists = buildDownloadableMediaLists(this.state, {pageTitle: tabTitle, pageUrlHash: shortSafeHash(tabUrl, 6)})
+        const frames = new Set<number>([...lists.keys(), ...this.publishedFrames])
+        for (const frameId of frames) {
+            const list = lists.get(frameId) ?? []
+            if (list.length > 0) {
+                this.publishedFrames.add(frameId)
+            } else {
+                this.publishedFrames.delete(frameId)
+            }
+            this.onMediaListUpdated.onListUpdated(frameId, list)
+        }
     }
 
     private async getTab() {
@@ -315,23 +446,49 @@ export class MediaOnTab {
     }
 }
 
-// ---------- building the list shown to the user ----------
+type Target = { frameId: number, headers: HeadersRecord }
+
+// ---------- building the lists shown to the user ----------
 
 type PageInfo = { pageTitle: string, pageUrlHash: string }
 
-export function buildDownloadableMediaList(state: TabMediaState, pageInfo: PageInfo): DownloadableMedia[] {
+function encryptionNote(encryption: HLSEncryption | undefined): string | undefined {
+    switch (encryption) {
+        case "aes-128":
+            return "encrypted (supported)"
+        case "sample-aes":
+            return "encrypted (SAMPLE-AES, needs ffmpeg)"
+        default:
+            return undefined
+    }
+}
+
+/** frameId -> list for that frame */
+export function buildDownloadableMediaLists(state: TabMediaState, pageInfo: PageInfo): Map<number, DownloadableMedia[]> {
     const entries = Object.values(state.entries)
     const variantUrls = new Set<string>()
-    const result: DownloadableMedia[] = []
+    const framesWithStreams = new Set<number>()
+    const result = new Map<number, DownloadableMedia[]>()
+    const add = (frameId: number, item: DownloadableMedia) => {
+        let list = result.get(frameId)
+        if (!list) {
+            list = []
+            result.set(frameId, list)
+        }
+        list.push(item)
+    }
 
     for (const entry of entries) {
+        if (entry.kind === "hls-master" || entry.kind === "hls-media" || entry.kind === "dash") {
+            framesWithStreams.add(entry.frameId)
+        }
         if (entry.kind !== "hls-master" || !entry.variants) continue
         entry.variants.forEach(v => variantUrls.add(v.url))
-        if (entry.isEncrypted) continue
+        if (entry.encryption === "drm") continue
         const qualities = createQualities(entry, state, pageInfo)
         if (qualities.length == 0) continue // variants are still being processed
         const best = qualities[0]
-        result.push({
+        add(entry.frameId, {
             type: "hls",
             uri: best.uri,
             requestHeaders: best.requestHeaders,
@@ -341,24 +498,42 @@ export function buildDownloadableMediaList(state: TabMediaState, pageInfo: PageI
             bandwidth: best.bandwidth,
             resolution: best.resolution,
             extension: best.extension,
+            note: best.note ?? encryptionNote(entry.encryption),
             qualities: qualities,
         })
     }
     for (const entry of entries) {
         if (entry.kind === "hls-media") {
             // variants of a known master are shown inside the master's quality list
-            if (variantUrls.has(entry.url) || !entry.isSupported || entry.isEncrypted) continue
+            if (variantUrls.has(entry.url) || entry.format === "unsupported" || entry.encryption === "drm") continue
             const name = `${pageInfo.pageTitle} - ${pageInfo.pageUrlHash}`
-            result.push({
+            add(entry.frameId, {
                 type: "hls",
                 uri: entry.url,
-                requestHeaders: entry.requestHeaders,
+                requestHeaders: withReferer(entry.requestHeaders, state.frames[String(entry.frameId)]),
                 displayName: pageInfo.pageTitle,
                 suggestedFullName: `${name}.${entry.extension}`,
                 duration: entry.duration !== undefined ? createDurationString(entry.duration) : undefined,
                 extension: entry.extension,
+                note: encryptionNote(entry.encryption),
+            })
+        } else if (entry.kind === "dash") {
+            if (entry.isDrm) continue
+            add(entry.frameId, {
+                type: "dash",
+                uri: entry.url,
+                requestHeaders: withReferer(entry.requestHeaders, state.frames[String(entry.frameId)]),
+                displayName: `${pageInfo.pageTitle} - DASH`,
+                suggestedFullName: `${pageInfo.pageTitle} - ${pageInfo.pageUrlHash}.mp4`,
+                duration: entry.duration !== undefined ? createDurationString(entry.duration) : undefined,
+                resolution: entry.maxHeight ? `up to ${entry.maxHeight}p` : undefined,
+                extension: "mpd",
+                note: "needs yt-dlp/ffmpeg",
+                downloadable: false,
             })
         } else if (entry.kind === "http") {
+            // MP4/audio fetched by a script in a frame that plays a stream are almost always that stream's segments
+            if (entry.viaScript && framesWithStreams.has(entry.frameId)) continue
             const mediaProps: string[] = []
             let name: string
             if (entry.name) {
@@ -368,10 +543,10 @@ export function buildDownloadableMediaList(state: TabMediaState, pageInfo: PageI
                 name = pageInfo.pageTitle
                 mediaProps.push(pageInfo.pageTitle, pageInfo.pageUrlHash)
             }
-            result.push({
+            add(entry.frameId, {
                 type: "http",
                 uri: entry.url,
-                requestHeaders: entry.requestHeaders,
+                requestHeaders: withReferer(entry.requestHeaders, state.frames[String(entry.frameId)]),
                 displayName: name,
                 suggestedFullName: mediaProps.join("-") + "." + entry.extension,
                 extension: entry.extension,
@@ -386,7 +561,7 @@ function createQualities(master: HLSMasterEntry, state: TabMediaState, pageInfo:
     const usable = (master.variants ?? [])
         .map(variant => ({variant, media: state.entries[variant.url]}))
         .filter((x): x is { variant: HLSVariantInfo, media: HLSMediaPlaylistEntry } =>
-            x.media?.kind === "hls-media" && x.media.isSupported && !x.media.isEncrypted
+            x.media?.kind === "hls-media" && x.media.format !== "unsupported" && x.media.encryption !== "drm"
         )
         .sort((a, b) =>
             (b.variant.height ?? 0) - (a.variant.height ?? 0)
@@ -410,13 +585,14 @@ function createQualities(master: HLSMasterEntry, state: TabMediaState, pageInfo:
         return {
             label: label,
             uri: media.url,
-            requestHeaders: media.requestHeaders,
+            requestHeaders: withReferer(media.requestHeaders, state.frames[String(master.frameId)]),
             displayName: displayName,
             suggestedFullName: `${displayName}.${media.extension}`,
             duration: media.duration !== undefined ? createDurationString(media.duration) : undefined,
             bandwidth: variant.bandwidth ? createBandwidthString(variant.bandwidth) : undefined,
             resolution: variant.width && variant.height ? `${variant.width}x${variant.height}` : undefined,
             extension: media.extension,
+            note: encryptionNote(media.encryption),
         }
     })
 }
@@ -451,7 +627,7 @@ function createDurationString(duration: number) {
     }
 }
 
-// ---------- HLS fetching / parsing ----------
+// ---------- HLS / DASH parsing ----------
 
 function parseHLS(hlsContent: string) {
     try {
@@ -459,6 +635,45 @@ function parseHLS(hlsContent: string) {
     } catch (e) {
         return null
     }
+}
+
+function getSegmentFormat(playlist: MediaPlaylist, playlistUrl: string): { format: HLSSegmentFormat, extension?: string } {
+    const first = playlist.segments[0]
+    const filename = getFileFromUrl(resolveUrl(first.uri, playlistUrl))
+    const segmentExtension = filename ? getFileExtension(filename)?.toLowerCase() : undefined
+    const hasInitSection = playlist.segments.some(segment => !!segment.map)
+    if (hasInitSection || (segmentExtension && HLSUtils.HLS_FMP4_SEGMENT_EXTENSIONS.includes(segmentExtension))) {
+        return {format: "fmp4", extension: "mp4"}
+    }
+    if (!segmentExtension) {
+        // segments without a file extension (e.g. "segment?id=1") are usually MPEG-TS
+        return {format: "ts", extension: "ts"}
+    }
+    if (HLSUtils.HLS_TS_SEGMENT_EXTENSIONS.includes(segmentExtension)) {
+        return {format: "ts", extension: segmentExtension}
+    }
+    return {format: "unsupported"}
+}
+
+const DRM_SYSTEM_IDS = [
+    "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed", // Widevine
+    "9a04f079-9840-4286-ab92-e65be0885f95", // PlayReady
+    "94ce86fb-07ff-4f43-adb8-93d2fa968ca2", // FairPlay
+]
+
+/** Small regex-based MPD summary (service workers have no DOMParser). */
+function parseMPDSummary(mpd: string): { duration?: number, maxHeight?: number, isDrm: boolean } {
+    const lower = mpd.toLowerCase()
+    const isDrm = DRM_SYSTEM_IDS.some(id => lower.includes(id))
+    let duration: number | undefined
+    const d = /mediaPresentationDuration\s*=\s*"P(?:(\d+(?:\.\d+)?)D)?T?(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?"/i.exec(mpd)
+    if (d) {
+        const [days, hours, minutes, seconds] = d.slice(1).map(v => v ? parseFloat(v) : 0)
+        duration = days * 86400 + hours * 3600 + minutes * 60 + seconds
+    }
+    const heights = Array.from(mpd.matchAll(/\bheight\s*=\s*"(\d+)"/gi), m => parseInt(m[1]))
+    const maxHeight = heights.length ? Math.max(...heights) : undefined
+    return {duration, maxHeight, isDrm}
 }
 
 function resolveUrl(uri: string, base: string) {
@@ -469,14 +684,43 @@ function resolveUrl(uri: string, base: string) {
     }
 }
 
-async function fetchHLSText(url: string, requestHeaders: HeadersRecord) {
-    const response = await run(async () => {
-        try {
-            return await fetch(new Request(url, {headers: requestHeaders}));
-        } catch (e) {
-            return null
-        }
+function hasAnyHeader(headers: Headers) {
+    let any = false
+    headers.forEach(() => {
+        any = true
     })
+    return any
+}
+
+async function fetchWithTimeout(request: Request, timeoutMs: number) {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    try {
+        return await fetch(request, {signal: controller.signal})
+    } catch (e) {
+        return null
+    } finally {
+        clearTimeout(timer)
+    }
+}
+
+/** Response headers of a media URL we only know by URL (HEAD request). */
+async function fetchHeadersOnly(url: string, requestHeaders: HeadersRecord): Promise<Headers | null> {
+    if (!/^https?:/i.test(url)) {
+        return null
+    }
+    const response = await fetchWithTimeout(new Request(url, {method: "HEAD", headers: requestHeaders}), 8_000)
+    if (!response || !inRange(response.status, 200, 299)) {
+        return null
+    }
+    return response.headers
+}
+
+async function fetchPlaylistText(url: string, requestHeaders: HeadersRecord, kind: "hls" | "dash") {
+    if (!/^https?:/i.test(url)) {
+        return null // e.g. blob: playlists only arrive with their content
+    }
+    const response = await fetchWithTimeout(new Request(url, {headers: requestHeaders}), 15_000)
     if (!response) {
         return null
     }
@@ -484,27 +728,25 @@ async function fetchHLSText(url: string, requestHeaders: HeadersRecord) {
         return null;
     }
     const contentType = response.headers.get("Content-Type")?.toLowerCase() ?? null
-    const contentTypeMatch = contentType !== null && HLSUtils.isHLSContentType(contentType)
     const length = getContentLength(response.headers)
-    const smallEnough = length !== null && length < HLSUtils.MAX_HLS_PLAYLIST_SIZE
-    // some servers don't send a proper content-type; we only got here because the url ends with .m3u8
-    // or the content-type matched, so accept the body if the type matches or the size is known and small
-    if (contentTypeMatch || smallEnough || (contentType === null && looksLikePlaylistUrl(url))) {
-        const text = await response.text()
-        if (text.length > HLSUtils.MAX_HLS_PLAYLIST_SIZE || !text.trimStart().startsWith("#EXTM3U")) {
+    if (length !== null && length > HLSUtils.MAX_HLS_PLAYLIST_SIZE) {
+        return null
+    }
+    const text = await run(async () => {
+        try {
+            return await response.text()
+        } catch (e) {
             return null
         }
-        return text
+    })
+    if (text === null || text.length > HLSUtils.MAX_HLS_PLAYLIST_SIZE) {
+        return null
     }
-    return null
-}
-
-function looksLikePlaylistUrl(url: string) {
-    try {
-        return new URL(url).pathname.toLowerCase().endsWith(".m3u8")
-    } catch (e) {
-        return false
+    // the body decides: some servers send text/plain or octet-stream for playlists
+    if (kind === "hls") {
+        return text.trimStart().startsWith("#EXTM3U") ? text : null
     }
+    return /<MPD[\s>]/.test(text) || (contentType?.includes("dash") ?? false) ? text : null
 }
 
 /**

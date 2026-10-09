@@ -109,6 +109,10 @@ function createPopup() {
         font-size: 10px;
         opacity: 0.7;
       }
+      .abdm-media-item-info-only {
+        cursor: default;
+        opacity: 0.6;
+      }
       .abdm-quality-select {
         margin-top: 4px;
         font-size: 11px;
@@ -182,13 +186,16 @@ function getBiggestMediaPlayer() {
         })[0] || null
 }
 
-function detailsText(item: { duration?: string, size?: string, resolution?: string, bandwidth?: string, extension?: string }) {
+function detailsText(item: {
+    duration?: string, size?: string, resolution?: string, bandwidth?: string, extension?: string, note?: string,
+}) {
     return [
         item.duration,
         item.size,
         item.resolution,
         item.bandwidth,
         item.extension,
+        item.note,
     ].filter(Boolean).join(" · ")
 }
 
@@ -219,6 +226,7 @@ function createMediaItemElement(item: DownloadableMedia) {
             bandwidth: q.bandwidth,
             resolution: q.resolution,
             extension: q.extension,
+            note: q.note,
         } : item
         // textContent: the page title comes from the page and must not be parsed as HTML
         titleEl.textContent = selected.displayName ?? "Unnamed media"
@@ -250,6 +258,9 @@ function createMediaItemElement(item: DownloadableMedia) {
     }
     select(initialIndex)
 
+    if (item.downloadable === false) {
+        el.classList.add("abdm-media-item-info-only")
+    }
     el.onclick = () => {
         onItemClick?.(selected)
     }

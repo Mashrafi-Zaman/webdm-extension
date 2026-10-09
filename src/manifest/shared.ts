@@ -24,6 +24,9 @@ export function getBaseManifest() {
         content_scripts: [{
             matches: ["*://*/*"],
             js: ["src/entrypoint/ContentScript.ts"],
+            // players are often inside (cross-origin or script-created about:blank) iframes
+            all_frames: true,
+            match_about_blank: true,
         }],
         options_ui: {
             page: "src/entrypoint/OptionUi/index.html",
