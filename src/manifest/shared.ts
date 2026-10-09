@@ -2,6 +2,8 @@ import pkg from "../../package.json";
 import ManifestPermissions = chrome.runtime.ManifestPermissions;
 
 export function getBaseManifest() {
+    const icon16="icons/icon-16.png"
+    const icon32="icons/icon-32.png"
     const icon48="icons/icon-48.png"
     const icon96="icons/icon-96.png"
     const icon128="icons/icon-128.png"
@@ -13,6 +15,8 @@ export function getBaseManifest() {
         author: pkg.author,
         default_locale: "en",
         icons: {
+            16: icon16,
+            32: icon32,
             48: icon48,
             96: icon96,
             128: icon128,
