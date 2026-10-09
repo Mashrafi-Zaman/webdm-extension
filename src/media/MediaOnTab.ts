@@ -2,7 +2,7 @@ import browser from "webextension-polyfill";
 import {InterceptedMediaResult, InterceptedMediaType} from "~/linkgrabber/LinkGrabberResponse";
 import {inRange} from "~/utils/NumberUtils";
 import {run} from "~/utils/ScopeFunctions";
-import {Resolution, Variant} from "hls-parser/types";
+import {MasterPlaylist, MediaPlaylist} from "hls-parser/types";
 import * as HLSUtils from "~/media/HLSUtils";
 import * as MultiMediaUtils from "~/media/MultiMediaUtils"
 import _ from "lodash";
@@ -10,117 +10,172 @@ import HLS from "hls-parser"
 import {getContentDisposition, getContentLength, getContentType} from "~/utils/HeaderUtils";
 import {getFileExtension, getFileFromUrl, getFileNameWithoutExtension} from "~/utils/URLUtils";
 import {getFileNameFromHeader} from "~/utils/ExtractFileNameFromHeader";
-import {MAX_HLS_PLAYLIST_SIZE} from "~/media/HLSUtils";
+import {TabMediaStore} from "~/media/TabMediaStore";
 
-type MediaLinkToProcess = {
-    pageIndex: number, // if this is not the same as current page index then we don't process it
-    link: string,
-    requestHeaders?: Record<string, string>,
-    resolution?: Resolution,
-    framerate?: number,
-    bandwidth?: number,
+// ---------- persisted (serializable) per-tab state ----------
+
+type HeadersRecord = Record<string, string>
+
+type HttpMediaEntry = {
+    kind: "http",
+    url: string,
+    requestHeaders: HeadersRecord,
     name?: string,
-    fileExtension?: string,
-    type?: InterceptedMediaType,
-    isEncrypted?: boolean,
-    duration?: number,
+    extension: string,
     size?: number,
-    myVariant?: Variant,
-    isProcessed: boolean, // when it is processed
+}
+
+export type HLSVariantInfo = {
+    url: string, // absolute
+    bandwidth?: number,
+    width?: number,
+    height?: number,
+    frameRate?: number,
+}
+
+type HLSMasterEntry = {
+    kind: "hls-master",
+    url: string,
+    requestHeaders: HeadersRecord,
+    // null = the master's content is not known (yet / any more) and must be fetched
+    variants: HLSVariantInfo[] | null,
+    isEncrypted?: boolean,
+}
+
+type HLSMediaPlaylistEntry = {
+    kind: "hls-media",
+    url: string,
+    requestHeaders: HeadersRecord,
+    extension?: string,
+    duration?: number,
+    isEncrypted?: boolean,
+    isSupported: boolean,
+}
+
+type MediaEntry = HttpMediaEntry | HLSMasterEntry | HLSMediaPlaylistEntry
+
+export type TabMediaState = {
+    entries: Record<string, MediaEntry>,
+}
+
+export function emptyTabMediaState(): TabMediaState {
+    return {entries: {}}
+}
+
+// ---------- what the content script receives ----------
+
+export type DownloadableMediaQuality = {
+    label: string, // e.g. "1080p"
+    uri: string,
+    requestHeaders?: Record<string, string>,
+    displayName: string,
+    suggestedFullName: string,
+    duration?: string,
+    bandwidth?: string,
+    resolution?: string,
+    extension?: string,
+}
+
+export type DownloadableMedia = {
+    type: InterceptedMediaType,
+    uri: string,
+    requestHeaders?: Record<string, string>,
+    displayName?: string
+    suggestedFullName?: string,
+    duration?: string,
+    bandwidth?: string,
+    resolution?: string,
+    extension?: string,
+    size?: string,
+    // for HLS master playlists: one entry per video, best quality first (uri/displayName above = qualities[0])
+    qualities?: DownloadableMediaQuality[],
 }
 
 export interface OnMedialListUpdated {
     onListUpdated(list: DownloadableMedia[]): void;
 }
 
-function applyHeadersToProcessingItem(mediaToProcess: MediaLinkToProcess, requestHeaders: Headers) {
-    const headersRecord: Record<string, string> = {}
-    requestHeaders.forEach((value, key) => {
-        headersRecord[key] = value
+function headersToRecord(headers: Headers): HeadersRecord {
+    const record: HeadersRecord = {}
+    headers.forEach((value, key) => {
+        record[key] = value
     })
-    mediaToProcess.requestHeaders = headersRecord
-    return headersRecord
+    return record
 }
 
+/**
+ * Detected media of one tab. State is persisted in [TabMediaStore] (storage.session) so it survives
+ * MV3 service-worker restarts; it's cleared when the tab navigates or closes.
+ */
 export class MediaOnTab {
-    private currentMediaToProcess: Record<string, MediaLinkToProcess> = {}
+    private state: TabMediaState = emptyTabMediaState()
+    private generation = 0 // bumped on reset, so results of an old page are dropped
+    private readonly inFlight = new Set<string>()
+    private readonly failed = new Set<string>()
     private isClosed = false
-    private pageIndex = 0
 
     public constructor(
-        public tabId: number,
-        private onMediaListUpdated: OnMedialListUpdated
+        public readonly tabId: number,
+        private readonly onMediaListUpdated: OnMedialListUpdated,
+        private readonly store: TabMediaStore,
     ) {
+    }
+
+    /** Load persisted state, then finish any HLS work that was interrupted (e.g. by a service-worker restart). */
+    async restore() {
+        this.state = await this.store.load(this.tabId) ?? emptyTabMediaState()
+        const generation = this.generation
+        const pending: Promise<void>[] = []
+        for (const entry of Object.values(this.state.entries)) {
+            if (entry.kind !== "hls-master") continue
+            if (entry.variants === null) {
+                // master playlist data was lost: fetch it again
+                pending.push(this.processHLS(entry.url, entry.requestHeaders, generation))
+                continue
+            }
+            for (const variant of entry.variants) {
+                if (!this.state.entries[variant.url]) {
+                    pending.push(this.processHLS(variant.url, entry.requestHeaders, generation))
+                }
+            }
+        }
+        await Promise.all(pending)
     }
 
     close(): void {
+        this.isClosed = true
         this.reset()
-        this.isClosed = true;
-    }
-
-    private isCanceled(
-        mediaLinkToProcess: MediaLinkToProcess,
-    ) {
-        if (this.isClosed) {
-            return true
-        }
-        return this.pageIndex !== mediaLinkToProcess.pageIndex;
     }
 
     reset() {
-        this.pageIndex++
-        this.currentMediaToProcess = {}
+        this.generation++
+        this.state = emptyTabMediaState()
+        this.inFlight.clear()
+        this.failed.clear()
     }
 
-    getOrCreateProcessingMedia(uri: string) {
-        const current = this.currentMediaToProcess[uri]
-        if (typeof current === "object") {
-            return current;
-        }
-
-        const newObject: MediaLinkToProcess = {
-            link: uri,
-            pageIndex: this.pageIndex,
-            isProcessed: false,
-        };
-        this.currentMediaToProcess[uri] = newObject;
-        return newObject
-    }
-
-    async process(
-        mediaResult: InterceptedMediaResult
-    ) {
-        if (this.isAlreadyProcessed(mediaResult.url)) {
-            return
-        }
-
+    async process(mediaResult: InterceptedMediaResult) {
+        const generation = this.generation
         switch (mediaResult.mediaType) {
             case "hls":
-                await this.processHLS(
-                    mediaResult.url,
-                    mediaResult.requestHeaders
-                )
+                await this.processHLS(mediaResult.url, headersToRecord(mediaResult.requestHeaders), generation)
                 break
             case "http":
-                await this.processHttp(
-                    mediaResult.url,
-                    mediaResult.requestHeaders,
-                    mediaResult.responseHeaders,
-                )
-                break;
+                await this.processHttp(mediaResult.url, mediaResult.requestHeaders, mediaResult.responseHeaders, generation)
+                break
         }
+    }
+
+    private isStale(generation: number) {
+        return this.isClosed || generation !== this.generation
     }
 
     private async processHttp(
-        url: string, requestHeaders: Headers, responseHeaders: Headers,
+        url: string, requestHeaders: Headers, responseHeaders: Headers, generation: number,
     ) {
-        const mediaToProcess = this.getOrCreateProcessingMedia(url);
-        if (mediaToProcess.isProcessed) {
+        if (this.state.entries[url]) {
             return
         }
-        mediaToProcess.isProcessed = true;
-        mediaToProcess.type = "http"
-        applyHeadersToProcessingItem(mediaToProcess, requestHeaders)
         let filenameWithExtension: string | null = null;
         let extension: string | null = null;
         const contentDisposition = getContentDisposition(responseHeaders);
@@ -143,151 +198,227 @@ export class MediaOnTab {
             // no extension ignore it
             return
         }
-        mediaToProcess.fileExtension = extension
-        if (filenameWithExtension) {
-            mediaToProcess.name = getFileNameWithoutExtension(filenameWithExtension)
+        const entry: HttpMediaEntry = {
+            kind: "http",
+            url: url,
+            requestHeaders: headersToRecord(requestHeaders),
+            extension: extension,
+            name: filenameWithExtension ? getFileNameWithoutExtension(filenameWithExtension) : undefined,
+            size: getContentLength(responseHeaders) ?? undefined,
         }
-        mediaToProcess.size = getContentLength(responseHeaders) ?? undefined
-        this.onMediaProcessed(mediaToProcess)
+        await this.commit(generation, entry)
     }
 
-    private async processHLS(url: string, requestHeaders: Headers) {
-        const mediaToProcess = this.getOrCreateProcessingMedia(url);
-        if (mediaToProcess.isProcessed) {
+    private async processHLS(url: string, requestHeaders: HeadersRecord, generation: number): Promise<void> {
+        const existing = this.state.entries[url]
+        if (existing && !(existing.kind === "hls-master" && existing.variants === null)) {
+            return // already known
+        }
+        if (this.inFlight.has(url) || this.failed.has(url)) {
             return
         }
-        mediaToProcess.isProcessed = true // even if it fails!
-        const request = new Request(url, {
-            headers: requestHeaders
-        });
-        const content = await fetchHSLText(request)
-        if (content == null) {
-            return
-        }
-        const playlist = this.parseHLS(content)
-        if (playlist == null) {
-            return
-        }
-        if (playlist.isMasterPlaylist) {
-            const playListEncrypted = HLSUtils.isPlayListEncrypted(playlist);
-            for (let variant of playlist.variants) {
-                const processingMedia = this.getOrCreateProcessingMedia(variant.uri);
-
-                if (playListEncrypted) {
-                    processingMedia.isEncrypted = true
-                    continue
-                }
-                processingMedia.myVariant = variant
-            }
-            if (playListEncrypted) {
+        this.inFlight.add(url)
+        try {
+            const content = await fetchHLSText(url, requestHeaders)
+            if (this.isStale(generation)) return
+            const playlist = content === null ? null : parseHLS(content)
+            if (playlist === null) {
+                this.failed.add(url)
                 return
             }
-            playlist.variants.forEach(variant => {
-                    const newRequest = run(() =>
-                        resolveVariantUrl(request, variant.uri)
-                    )
-                this.processHLS(newRequest.url, newRequest.headers)
-                }
-            )
-        } else {
-            if (playlist.segments.length == 0) {
-                return // empty list?
+            if (playlist.isMasterPlaylist) {
+                await this.onMasterPlaylist(url, requestHeaders, playlist, generation)
+            } else {
+                await this.onMediaPlaylist(url, requestHeaders, playlist, generation)
             }
-            const filename = getFileFromUrl(playlist.segments[0].uri)
-            const extension = filename && getFileExtension(filename)
-            if (extension !== "ts") {
-                return // we only support ts files for now
-            }
-            mediaToProcess.fileExtension = extension
-            mediaToProcess.type = "hls"
-            mediaToProcess.link = request.url
-            mediaToProcess.duration = _.sumBy(
-                playlist.segments, value => value.duration
-            )
-            mediaToProcess.bandwidth = mediaToProcess.myVariant?.bandwidth
-            mediaToProcess.resolution = mediaToProcess.myVariant?.resolution
-            mediaToProcess.framerate = mediaToProcess.myVariant?.frameRate
-            mediaToProcess.isEncrypted = mediaToProcess.isEncrypted || HLSUtils.isMediaPlayListEncrypted(playlist)
-            // it only needed for media playlist
-            applyHeadersToProcessingItem(mediaToProcess, requestHeaders)
-            this.onMediaProcessed(mediaToProcess)
+        } finally {
+            this.inFlight.delete(url)
         }
     }
 
-
-    parseHLS(
-        hlsContent: string,
-    ) {
-        return run(() => {
-            try {
-                return HLS.parse(hlsContent)
-            } catch (e) {
-                return null
-            }
-        })
+    private async onMasterPlaylist(url: string, requestHeaders: HeadersRecord, playlist: MasterPlaylist, generation: number) {
+        const variants: HLSVariantInfo[] = _.uniqBy(
+            playlist.variants.map((variant) => ({
+                // variant URIs are usually relative to the master playlist; store them absolute
+                url: resolveUrl(variant.uri, url),
+                bandwidth: variant.bandwidth,
+                width: variant.resolution?.width,
+                height: variant.resolution?.height,
+                frameRate: variant.frameRate,
+            })),
+            v => v.url,
+        )
+        const entry: HLSMasterEntry = {
+            kind: "hls-master",
+            url: url,
+            requestHeaders: requestHeaders,
+            variants: variants,
+            isEncrypted: HLSUtils.isPlayListEncrypted(playlist),
+        }
+        await this.commit(generation, entry)
+        if (entry.isEncrypted) {
+            return
+        }
+        // fetch each variant (media playlist) to learn duration / segment type / encryption
+        await Promise.all(variants.map(v => this.processHLS(v.url, requestHeaders, generation)))
     }
 
-    private isAlreadyProcessed(link: string) {
-        return this.currentMediaToProcess[link]?.isProcessed ?? false
+    private async onMediaPlaylist(url: string, requestHeaders: HeadersRecord, playlist: MediaPlaylist, generation: number) {
+        if (playlist.segments.length == 0) {
+            return // empty list?
+        }
+        const filename = getFileFromUrl(resolveUrl(playlist.segments[0].uri, url))
+        const extension = filename ? getFileExtension(filename) : undefined
+        const entry: HLSMediaPlaylistEntry = {
+            kind: "hls-media",
+            url: url,
+            requestHeaders: requestHeaders,
+            extension: extension ?? undefined,
+            duration: _.sumBy(playlist.segments, segment => segment.duration),
+            isEncrypted: HLSUtils.isMediaPlayListEncrypted(playlist),
+            isSupported: extension === "ts", // we only support ts files for now
+        }
+        await this.commit(generation, entry)
     }
 
-    async getTab() {
+    private async commit(generation: number, entry: MediaEntry) {
+        if (this.isStale(generation)) {
+            return
+        }
+        this.state.entries[entry.url] = entry
+        await this.store.save(this.tabId, this.state)
+        await this.publish()
+    }
+
+    /** Send the current list to the tab's content script. */
+    async publish() {
+        if (this.isClosed) {
+            return
+        }
+        const tab = await this.getTab()
+        const tabTitle = tab?.title
+        const tabUrl = tab?.url
+        if (!tabTitle || !tabUrl) {
+            return
+        }
+        this.onMediaListUpdated.onListUpdated(
+            buildDownloadableMediaList(this.state, {pageTitle: tabTitle, pageUrlHash: shortSafeHash(tabUrl, 6)})
+        )
+    }
+
+    private async getTab() {
         try {
             return (await browser.tabs.get(this.tabId))
         } catch (e) {
             return null
         }
     }
-
-    private async onMediaProcessed(
-        media: MediaLinkToProcess
-    ) {
-        if (this.isCanceled(media)) {
-            return
-        }
-        await this.reloadList()
-    }
-
-    private async reloadList() {
-        const tab = await this.getTab()
-        if (!tab) {
-            return
-        }
-        const tabTitle = tab.title
-        const tabUrl = tab.url
-        if (!tabTitle || !tabUrl) {
-            return
-            // tab title is not defined
-        }
-
-        const downloadableMediaList = _
-            .entries(this.currentMediaToProcess)
-            .map(([_, value]) => {
-                return createDownloadableMedia(
-                    value,
-                    {
-                        pageTitle: tabTitle,
-                        pageUrlHash: shortSafeHash(tabUrl, 6),
-                    });
-            })
-            .filter(i => i != null)
-        this.onMediaListUpdated.onListUpdated(downloadableMediaList)
-    }
-
-
 }
 
-export type DownloadableMedia = {
-    type: InterceptedMediaType,
-    uri: string,
-    requestHeaders?: Record<string, string>,
-    displayName?: string
-    suggestedFullName?: string,
-    duration?: string,
-    bandwidth?: string,
-    resolution?: string,
-    extension?: string,
-    size?: string,
+// ---------- building the list shown to the user ----------
+
+type PageInfo = { pageTitle: string, pageUrlHash: string }
+
+export function buildDownloadableMediaList(state: TabMediaState, pageInfo: PageInfo): DownloadableMedia[] {
+    const entries = Object.values(state.entries)
+    const variantUrls = new Set<string>()
+    const result: DownloadableMedia[] = []
+
+    for (const entry of entries) {
+        if (entry.kind !== "hls-master" || !entry.variants) continue
+        entry.variants.forEach(v => variantUrls.add(v.url))
+        if (entry.isEncrypted) continue
+        const qualities = createQualities(entry, state, pageInfo)
+        if (qualities.length == 0) continue // variants are still being processed
+        const best = qualities[0]
+        result.push({
+            type: "hls",
+            uri: best.uri,
+            requestHeaders: best.requestHeaders,
+            displayName: best.displayName,
+            suggestedFullName: best.suggestedFullName,
+            duration: best.duration,
+            bandwidth: best.bandwidth,
+            resolution: best.resolution,
+            extension: best.extension,
+            qualities: qualities,
+        })
+    }
+    for (const entry of entries) {
+        if (entry.kind === "hls-media") {
+            // variants of a known master are shown inside the master's quality list
+            if (variantUrls.has(entry.url) || !entry.isSupported || entry.isEncrypted) continue
+            const name = `${pageInfo.pageTitle} - ${pageInfo.pageUrlHash}`
+            result.push({
+                type: "hls",
+                uri: entry.url,
+                requestHeaders: entry.requestHeaders,
+                displayName: pageInfo.pageTitle,
+                suggestedFullName: `${name}.${entry.extension}`,
+                duration: entry.duration !== undefined ? createDurationString(entry.duration) : undefined,
+                extension: entry.extension,
+            })
+        } else if (entry.kind === "http") {
+            const mediaProps: string[] = []
+            let name: string
+            if (entry.name) {
+                name = entry.name
+                mediaProps.push(name)
+            } else {
+                name = pageInfo.pageTitle
+                mediaProps.push(pageInfo.pageTitle, pageInfo.pageUrlHash)
+            }
+            result.push({
+                type: "http",
+                uri: entry.url,
+                requestHeaders: entry.requestHeaders,
+                displayName: name,
+                suggestedFullName: mediaProps.join("-") + "." + entry.extension,
+                extension: entry.extension,
+                size: entry.size !== undefined ? createSizeString(entry.size) : undefined,
+            })
+        }
+    }
+    return result
+}
+
+function createQualities(master: HLSMasterEntry, state: TabMediaState, pageInfo: PageInfo): DownloadableMediaQuality[] {
+    const usable = (master.variants ?? [])
+        .map(variant => ({variant, media: state.entries[variant.url]}))
+        .filter((x): x is { variant: HLSVariantInfo, media: HLSMediaPlaylistEntry } =>
+            x.media?.kind === "hls-media" && x.media.isSupported && !x.media.isEncrypted
+        )
+        .sort((a, b) =>
+            (b.variant.height ?? 0) - (a.variant.height ?? 0)
+            || (b.variant.bandwidth ?? 0) - (a.variant.bandwidth ?? 0)
+        )
+    // "720p" is ambiguous when a master has two 720p variants: add the bitrate then
+    const heightCounts = _.countBy(usable, x => x.variant.height ?? "none")
+    return usable.map(({variant, media}, index) => {
+        let label: string
+        if (variant.height) {
+            label = `${variant.height}p`
+            if (heightCounts[variant.height] > 1 && variant.bandwidth) {
+                label += ` (${createBandwidthString(variant.bandwidth)})`
+            }
+        } else if (variant.bandwidth) {
+            label = createBandwidthString(variant.bandwidth)
+        } else {
+            label = `Quality ${index + 1}`
+        }
+        const displayName = `${pageInfo.pageTitle} - ${label}`
+        return {
+            label: label,
+            uri: media.url,
+            requestHeaders: media.requestHeaders,
+            displayName: displayName,
+            suggestedFullName: `${displayName}.${media.extension}`,
+            duration: media.duration !== undefined ? createDurationString(media.duration) : undefined,
+            bandwidth: variant.bandwidth ? createBandwidthString(variant.bandwidth) : undefined,
+            resolution: variant.width && variant.height ? `${variant.width}x${variant.height}` : undefined,
+            extension: media.extension,
+        }
+    })
 }
 
 function createBandwidthString(bandwidth: number) {
@@ -306,81 +437,6 @@ function createSizeString(size: number): string {
     return `${size.toFixed(2)} ${units[unitIndex]}`;
 }
 
-function createDownloadableMedia(
-    mediaLinkToProcess: MediaLinkToProcess,
-    pageInfo: {
-        pageTitle: string
-        pageUrlHash: string
-    },
-): DownloadableMedia | null {
-    if (!mediaLinkToProcess.type) {
-        // console.log("media doesn't have type", {mediaLinkToProcess})
-        return null
-    }
-    if (mediaLinkToProcess.isEncrypted) {
-        // console.log("media is encrypted", {mediaLinkToProcess})
-        return null
-    }
-    if (!mediaLinkToProcess.fileExtension) {
-        // console.log("media has no file extension", {mediaLinkToProcess})
-        return null
-    }
-
-    const mediaProps = []
-    let name: string
-    if (mediaLinkToProcess.name) {
-        name = mediaLinkToProcess.name
-        mediaProps.push(name)
-    } else {
-        name = pageInfo.pageTitle
-        mediaProps.push(pageInfo.pageTitle)
-        mediaProps.push(pageInfo.pageUrlHash)
-    }
-
-    let resolutionString: string | undefined
-    if (mediaLinkToProcess.resolution) {
-        resolutionString = createResolutionString(mediaLinkToProcess.resolution);
-        mediaProps.push(
-            resolutionString
-        )
-    }
-    if (mediaLinkToProcess.framerate) {
-        mediaProps.push(
-            `${mediaLinkToProcess.framerate}fps`
-        )
-    }
-
-    let durationString: string | undefined = undefined
-    if (typeof mediaLinkToProcess.duration == "number") {
-        durationString = createDurationString(mediaLinkToProcess.duration)
-    }
-    let bandwidthString: string | undefined = undefined
-    if (typeof mediaLinkToProcess.bandwidth == "number") {
-        bandwidthString = createBandwidthString(mediaLinkToProcess.bandwidth)
-    }
-    let sizeString: string | undefined = undefined
-    if (typeof mediaLinkToProcess.size == "number") {
-        sizeString = createSizeString(mediaLinkToProcess.size)
-    }
-    return {
-        uri: mediaLinkToProcess.link,
-        requestHeaders: mediaLinkToProcess.requestHeaders,
-        displayName: name,
-        suggestedFullName: mediaProps.join("-") + "." + mediaLinkToProcess.fileExtension,
-        type: mediaLinkToProcess.type,
-        duration: durationString,
-        extension: mediaLinkToProcess.fileExtension,
-        size: sizeString,
-        resolution: resolutionString,
-        bandwidth: bandwidthString,
-    }
-}
-
-function createResolutionString(resolution: Resolution) {
-    return `${resolution.width}p`
-}
-
-
 function createDurationString(duration: number) {
     const seconds = Math.floor(duration % 60)
     const minutes = Math.floor((duration / 60) % 60)
@@ -395,16 +451,28 @@ function createDurationString(duration: number) {
     }
 }
 
+// ---------- HLS fetching / parsing ----------
 
-async function fetchHSLText(
-    request: Request
-) {
-    const acceptedContentTypes = HLSUtils.HLS_CONTENT_TYPES
-    const maxHLSPlaylistSize = HLSUtils.MAX_HLS_PLAYLIST_SIZE
+function parseHLS(hlsContent: string) {
+    try {
+        return HLS.parse(hlsContent)
+    } catch (e) {
+        return null
+    }
+}
 
+function resolveUrl(uri: string, base: string) {
+    try {
+        return new URL(uri, base).toString()
+    } catch (e) {
+        return uri
+    }
+}
+
+async function fetchHLSText(url: string, requestHeaders: HeadersRecord) {
     const response = await run(async () => {
         try {
-            return await fetch(request);
+            return await fetch(new Request(url, {headers: requestHeaders}));
         } catch (e) {
             return null
         }
@@ -415,47 +483,27 @@ async function fetchHSLText(
     if (!inRange(response.status, 200, 299)) {
         return null;
     }
-    const contentType = response
-        .headers
-        .get("Content-Type")
-        ?.toLowerCase()
-    if (!contentType) {
-        return null
-    }
-    const contentTypeMatch = acceptedContentTypes.some(
-        item => contentType.startsWith(item)
-    )
+    const contentType = response.headers.get("Content-Type")?.toLowerCase() ?? null
+    const contentTypeMatch = contentType !== null && HLSUtils.isHLSContentType(contentType)
     const length = getContentLength(response.headers)
-    let largeOrUnknownSize = true
-    if (length !== null && length < maxHLSPlaylistSize) {
-        largeOrUnknownSize = false
-    }
-    // some servers don't send proper content-type (@see HLSUtils.HLS_CONTENT_TYPES)
-    // however we parse the data as the request contains m3u8 in its url (we've already filtered the requests that matching m3u8 in [browder.webRequest])
-    // which probably contains playlist
-    // we first check content type if its valid we don't care about the size
-    // if the content type is not available we only proceed
-    // if the content-length exists and is smaller than max allowed size
-    if (contentTypeMatch || !largeOrUnknownSize) {
-        return await response.text();
+    const smallEnough = length !== null && length < HLSUtils.MAX_HLS_PLAYLIST_SIZE
+    // some servers don't send a proper content-type; we only got here because the url ends with .m3u8
+    // or the content-type matched, so accept the body if the type matches or the size is known and small
+    if (contentTypeMatch || smallEnough || (contentType === null && looksLikePlaylistUrl(url))) {
+        const text = await response.text()
+        if (text.length > HLSUtils.MAX_HLS_PLAYLIST_SIZE || !text.trimStart().startsWith("#EXTM3U")) {
+            return null
+        }
+        return text
     }
     return null
 }
 
-
-function resolveVariantUrl(
-    request: Request, // manifest request
-    variantUrl: string,
-) {
+function looksLikePlaylistUrl(url: string) {
     try {
-        const parsed = new URL(variantUrl, request.url);
-        const o: Request = new Request(parsed.toString())
-        request.headers.forEach((value, key, _) => {
-            o.headers.set(key, value);
-        })
-        return o
+        return new URL(url).pathname.toLowerCase().endsWith(".m3u8")
     } catch (e) {
-        return new Request(variantUrl)
+        return false
     }
 }
 

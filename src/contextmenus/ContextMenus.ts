@@ -4,6 +4,7 @@ import {DownloadRequestItem,DownloadRequestHeaders} from "~/interfaces/DownloadR
 import {sendMessage} from "webext-bridge/background"
 import {addDownload, getHeadersForUrl} from "~/background/actions";
 import {DefinedCommands} from "~/message/Commands";
+import {whenBackgroundReady} from "~/background/BackgroundReady";
 const optionIds = Object.freeze({
     downloadWithAbDm: "download-with-ab-dm",
     downloadSelectedWithAbDm: "download-selected-with-ab-dm",
@@ -27,8 +28,10 @@ async function createOptions() {
     })
 }
 
-function createOnCLickHandlers() {
+/** Registers the click listener synchronously; must be called at the top level of the background script. */
+export function registerContextMenuClickHandler() {
     browser.contextMenus.onClicked.addListener(async (args) => {
+        await whenBackgroundReady()
         switch (args.menuItemId) {
             case optionIds.downloadWithAbDm:
                 const link = args.linkUrl || args.srcUrl
@@ -75,5 +78,4 @@ function createOnCLickHandlers() {
 
 export async function initializeOptions() {
     await createOptions()
-    createOnCLickHandlers()
 }

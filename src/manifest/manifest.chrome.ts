@@ -23,7 +23,8 @@ export function getManifestForChrome(): ManifestV3 {
         },
         action: getBrowserActionInfo(),
         host_permissions: getHostPermissions(),
-        permissions: getCommonPermissions(),
+        // "scripting": inject the content script into tabs that were open before install/update
+        permissions: [...getCommonPermissions(), "scripting"],
     }
     /*return {
         manifest_version: 2,

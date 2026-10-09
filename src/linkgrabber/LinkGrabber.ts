@@ -5,7 +5,11 @@ import {run} from "~/utils/ScopeFunctions";
 import {Manifest3DownloadLinkInterceptor} from "~/linkgrabber/Manifest3DownloadLinkInterceptor";
 import {MediaRegistry} from "~/media/MediaRegistry";
 
-export function redirectDownloadLinksToMe() {
+/** Registers all request/download/tab listeners synchronously. */
+export function redirectDownloadLinksToMe(): {
+    mediaRegistry: MediaRegistry,
+    interceptor: DownloadLinkInterceptor,
+} {
     const downloadMediaRegistry = new MediaRegistry()
     downloadMediaRegistry.boot()
     const downloadLinkInterceptor: DownloadLinkInterceptor = run(() => {
@@ -18,4 +22,8 @@ export function redirectDownloadLinksToMe() {
     })
     downloadLinkInterceptor.redirectDownloadsToExtension()
     downloadLinkInterceptor.setOnMediaDetectedListener(downloadMediaRegistry)
+    return {
+        mediaRegistry: downloadMediaRegistry,
+        interceptor: downloadLinkInterceptor,
+    }
 }

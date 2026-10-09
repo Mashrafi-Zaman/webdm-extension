@@ -5,12 +5,16 @@ let popupEl: HTMLDivElement | null = null
 let dismissed = false
 let listVisible = false // start collapsed
 let onItemClick: ((item: DownloadableMedia) => void) | undefined
+const chosenQualityUris = new Set<string>()
 
 /**
  * Create the main popup element
  */
 function createPopup() {
     if (popupEl) return popupEl
+    // a popup left behind by an instance of this script from before an extension reload/update
+    // (its extension context is dead, so it can't update or download anymore)
+    document.querySelectorAll(".abdm-extension").forEach(el => el.remove())
     const downloadMediaTitle = browser.i18n.getMessage("download_media_title")
     const wrapper = document.createElement("div")
     wrapper.className = "abdm-extension"
@@ -105,6 +109,16 @@ function createPopup() {
         font-size: 10px;
         opacity: 0.7;
       }
+      .abdm-quality-select {
+        margin-top: 4px;
+        font-size: 11px;
+        color: #fff;
+        background: #2E3038;
+        border: rgba(255,255,255,0.25) solid 1px;
+        border-radius: 6px;
+        padding: 1px 4px;
+        cursor: pointer;
+      }
     `
     wrapper.appendChild(styleEl)
 
@@ -168,6 +182,80 @@ function getBiggestMediaPlayer() {
         })[0] || null
 }
 
+function detailsText(item: { duration?: string, size?: string, resolution?: string, bandwidth?: string, extension?: string }) {
+    return [
+        item.duration,
+        item.size,
+        item.resolution,
+        item.bandwidth,
+        item.extension,
+    ].filter(Boolean).join(" · ")
+}
+
+/**
+ * One row per video. HLS masters get a quality dropdown; clicking the row downloads the selected quality.
+ */
+function createMediaItemElement(item: DownloadableMedia) {
+    const el = document.createElement("div")
+    el.className = "abdm-media-item"
+
+    const titleEl = document.createElement("div")
+    titleEl.className = "abdm-item-title"
+    const detailsEl = document.createElement("div")
+    detailsEl.className = "abdm-item-details"
+    el.append(titleEl, detailsEl)
+
+    const qualities = item.qualities ?? []
+    let selected: DownloadableMedia = item
+    const select = (index: number) => {
+        const q = qualities[index]
+        selected = q ? {
+            ...item,
+            uri: q.uri,
+            requestHeaders: q.requestHeaders,
+            displayName: q.displayName,
+            suggestedFullName: q.suggestedFullName,
+            duration: q.duration,
+            bandwidth: q.bandwidth,
+            resolution: q.resolution,
+            extension: q.extension,
+        } : item
+        // textContent: the page title comes from the page and must not be parsed as HTML
+        titleEl.textContent = selected.displayName ?? "Unnamed media"
+        detailsEl.textContent = detailsText(selected)
+    }
+
+    // the list is rebuilt whenever more media is detected; keep the user's quality choice
+    const initialIndex = Math.max(0, qualities.findIndex(q => chosenQualityUris.has(q.uri)))
+    if (qualities.length > 1) {
+        const dropdown = document.createElement("select")
+        dropdown.className = "abdm-quality-select"
+        qualities.forEach((q, index) => {
+            const option = document.createElement("option")
+            option.value = String(index)
+            option.textContent = q.label
+            dropdown.appendChild(option)
+        })
+        dropdown.value = String(initialIndex)
+        // choosing a quality must not trigger the row's download click
+        dropdown.addEventListener("click", e => e.stopPropagation())
+        dropdown.addEventListener("mousedown", e => e.stopPropagation())
+        dropdown.addEventListener("change", () => {
+            const index = Number(dropdown.value)
+            qualities.forEach(q => chosenQualityUris.delete(q.uri))
+            chosenQualityUris.add(qualities[index].uri)
+            select(index)
+        })
+        el.appendChild(dropdown)
+    }
+    select(initialIndex)
+
+    el.onclick = () => {
+        onItemClick?.(selected)
+    }
+    return el
+}
+
 /**
  * Set the click listener for media items
  */
@@ -196,28 +284,7 @@ export function updatePopup(items: DownloadableMedia[]) {
     listContainer.innerHTML = ""
 
     for (const item of items) {
-        const el = document.createElement("div")
-        el.className = "abdm-media-item"
-
-        const title = item.displayName ?? "Unnamed media"
-        const details = [
-            item.duration,
-            item.size,
-            item.resolution,
-            item.bandwidth,
-            item.extension,
-        ].filter(Boolean).join(" · ")
-
-        el.innerHTML = `
-          <div class="abdm-item-title">${title}</div>
-          <div class="abdm-item-details">${details}</div>
-        `
-
-        el.onclick = () => {
-            onItemClick?.(item)
-        }
-
-        listContainer.appendChild(el)
+        listContainer.appendChild(createMediaItemElement(item))
     }
 
     // Position near video/audio or fallback top-left

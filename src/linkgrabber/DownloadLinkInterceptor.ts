@@ -17,6 +17,8 @@ import {getContentLength, getContentType} from "~/utils/HeaderUtils";
 import {getFileExtension, getFileFromHeaders, getFileFromUrl} from "~/utils/URLUtils";
 import _ from "lodash";
 import * as BackgroundSharedState from "~/background/BackgroundSharedState";
+import * as HLSUtils from "~/media/HLSUtils";
+import {whenBackgroundReady} from "~/background/BackgroundReady";
 
 type TabInfo = {
     title?: string,
@@ -87,7 +89,7 @@ export abstract class DownloadLinkInterceptor {
         requestHeaders: Headers,
         responseHeaders: Headers,
     ): InterceptedMediaResult | false {
-        // we only receive requests that have m3u8 so it should be fine
+        // callers already checked HLSUtils.isHLSPlaylist (".m3u8" path or HLS Content-Type)
         return {
             type: "media",
             mediaType: "hls",
@@ -317,40 +319,28 @@ export abstract class DownloadLinkInterceptor {
             filter,
         )
         browser.webRequest.onResponseStarted.addListener(
-            (details) => {
+            async (details) => {
+                await whenBackgroundReady()
                 const request = this.pendingRequests[details.requestId]
-                if (!request) {
+                const contentType = getContentType(getHeaders(details.responseHeaders))
+                // HLS playlists: by ".m3u8" in the path or by Content-Type (players fetch them via XHR/fetch,
+                // or as "media" when the browser plays HLS natively)
+                if (HLSUtils.isHLSPlaylist(details.url, contentType)) {
+                    // the request may have started before a service-worker restart; headers are optional for playlists
+                    this.checkForHLS(details, request?.finalRequest)
                     return
                 }
-                this.checkForDirectMedia(details, request.finalRequest)
+                if (details.type === "media" && request) {
+                    this.checkForDirectMedia(details, request.finalRequest)
+                }
             },
             {
-                types: ["media"],
+                types: ["media", "xmlhttprequest"],
                 urls: ["*://*/*"],
             },
             [
                 "responseHeaders"
             ],
-        )
-        browser.webRequest.onResponseStarted.addListener(
-            (details) => {
-                const request = this.pendingRequests[details.requestId]
-                if (!request) {
-                    return
-                }
-                this.checkForHLS(details, request.finalRequest)
-            }, {
-                types: ["xmlhttprequest"],
-                urls: [
-                    "http://*/*.m3u8",
-                    "https://*/*.m3u8",
-                    "http://*/*.m3u8?*",
-                    "https://*/*.m3u8?*",
-                ],
-            },
-            [
-                "responseHeaders"
-            ]
         )
         browser.webRequest.onCompleted.addListener(
             (details) => {
@@ -361,6 +351,7 @@ export abstract class DownloadLinkInterceptor {
         browser.webRequest.onHeadersReceived.addListener(
             async (details) => {
                 try {
+                    await whenBackgroundReady()
                     const request = this.pendingRequests[details.requestId]
                     if (request === undefined) {
                         return this.passResponse()
@@ -401,6 +392,7 @@ export abstract class DownloadLinkInterceptor {
             })
         )
         browser.downloads?.onCreated?.addListener(async (details) => {
+            await whenBackgroundReady()
             if (!getLatestConfig().autoCaptureLinks) {
                 // console.log("autoCaptureLinks is disabled")
                 return
@@ -533,6 +525,31 @@ export abstract class DownloadLinkInterceptor {
         )
     }
 
+    /**
+     * Playlists a page already loaded before this extension instance was listening (e.g. after the
+     * extension was reloaded/updated), reported by its content script. No request headers are known.
+     */
+    onPlaylistsReportedByPage(tabId: number, pageUrl: string | null, urls: string[]) {
+        if (!Configs.getLatestConfig().popupEnabled) {
+            return
+        }
+        if (pageUrl && (this.isInConfigBlacklist(pageUrl) || this.isInMediaBlackList(pageUrl))) {
+            return
+        }
+        for (const url of urls) {
+            if (this.isInConfigBlacklist(url) || this.isInMediaBlackList(url)) {
+                continue
+            }
+            this.onMediaDetected(tabId, {
+                type: "media",
+                mediaType: "hls",
+                url: url,
+                requestHeaders: new Headers(),
+                responseHeaders: new Headers(),
+            })
+        }
+    }
+
     onMediaDetected(tabId: number, mediaResult: InterceptedMediaResult) {
         this.onMediaDetectedListener?.onMediaDetected(
             tabId, mediaResult,
@@ -606,13 +623,13 @@ export abstract class DownloadLinkInterceptor {
         this.onMediaDetectedListener = onMediaDetectedListener
     }
 
-    private checkForHLS(details: WebRequest.OnResponseStartedDetailsType, request: WebRequest.OnSendHeadersDetailsType) {
-        if (!this.shouldProcessMedia(details)) {
+    private checkForHLS(details: WebRequest.OnResponseStartedDetailsType, request: WebRequest.OnSendHeadersDetailsType | undefined) {
+        if (!this.shouldProcessMedia(details, true)) {
             return
         }
         const isHLS = this.isHLSRequest(
             details.url,
-            getHeaders(request.requestHeaders),
+            getHeaders(request?.requestHeaders),
             getHeaders(details.responseHeaders),
         );
         if (isHLS) {
@@ -623,7 +640,10 @@ export abstract class DownloadLinkInterceptor {
         }
     }
 
-    private shouldProcessMedia(details: WebRequest.OnResponseStartedDetailsType | WebRequest.OnCompletedDetailsType) {
+    private shouldProcessMedia(
+        details: WebRequest.OnResponseStartedDetailsType | WebRequest.OnCompletedDetailsType,
+        isPlaylist: boolean,
+    ) {
         if (!Configs.getLatestConfig().popupEnabled) {
             return false
         }
@@ -643,16 +663,19 @@ export abstract class DownloadLinkInterceptor {
                 return false
             }
         }
-        // check file size minimum requirement
-        const contentLength = getContentLength(getHeaders(details.responseHeaders))
-        if (!this.doWeAcceptThisFileSize(contentLength)) {
-            return false
+        // check file size minimum requirement; not for playlists, which are tiny text files
+        // describing a (usually large) video
+        if (!isPlaylist) {
+            const contentLength = getContentLength(getHeaders(details.responseHeaders))
+            if (!this.doWeAcceptThisFileSize(contentLength)) {
+                return false
+            }
         }
         return true
     }
 
     private checkForDirectMedia(details: WebRequest.OnResponseStartedDetailsType, request: WebRequest.OnSendHeadersDetailsType) {
-        if (!this.shouldProcessMedia(details)) {
+        if (!this.shouldProcessMedia(details, false)) {
             return
         }
         const isMedia = this.isDirectMedia(

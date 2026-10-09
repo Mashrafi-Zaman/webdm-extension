@@ -11,6 +11,12 @@ export default defineConfig(() => {
     build:{
       outDir:`dist/${getExtensionBrowserTarget()}`
     },
+    // Emit ASCII-only JS (non-ASCII chars become \u escapes). Content-script chunks are
+    // loaded via dynamic import and can be decoded with the wrong charset, which turned
+    // "·" into "Â·" in the media popup.
+    esbuild: {
+      charset: "ascii",
+    },
     resolve: {
       alias: {
         "~": path.resolve(__dirname, "./src"),

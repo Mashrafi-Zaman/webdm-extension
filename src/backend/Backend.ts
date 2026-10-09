@@ -33,21 +33,26 @@ function getOrInitNativeMessagingApi() {
     return nativeMessaging
 }
 
-export async function boot() {
-    const nativeMessagingApi = getOrInitNativeMessagingApi()
-
-    _isNativeMessagingSupported = await nativeMessagingApi.test()
-    if (isNativeMessagingSupported()) {
-        console.log("Native messaging is available")
-    } else {
-        console.log("Native messaging is not available!")
-    }
-
+export function boot() {
     Configs.onChanged.addEventListener((event) => {
         run(async () => {
             const port = (event.port)
             httpApi = createHttpApiClient(port)
         })
+    })
+    // test native messaging in the background; until it finishes, requests fall back to HTTP
+    run(async () => {
+        const nativeMessagingApi = getOrInitNativeMessagingApi()
+        try {
+            _isNativeMessagingSupported = await nativeMessagingApi.test()
+        } catch (e) {
+            _isNativeMessagingSupported = false
+        }
+        if (isNativeMessagingSupported()) {
+            console.log("Native messaging is available")
+        } else {
+            console.log("Native messaging is not available!")
+        }
     })
 }
 
