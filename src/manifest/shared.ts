@@ -33,7 +33,7 @@ export function getBaseManifest() {
 
 export function getBrowserActionInfo(){
     return  {
-        default_title: "AB Download Manager",
+        default_title: "WebDM Integration",
         default_popup: "src/entrypoint/BrowserAction/index.html",
     }
 }

@@ -9,16 +9,16 @@
     "message": "Please first make a selection"
   },
   "context_menu_download_with_abdm": {
-    "message": "Download with AB DM"
+    "message": "Download with WebDM"
   },
   "context_menu_download_selected_links_with_abdm": {
-    "message": "Download selected links with AB DM"
+    "message": "Download selected links with WebDM"
   },
   "browser_action_popup_title": {
-    "message": "AB DM Quick Settings"
+    "message": "WebDM Quick Settings"
   },
   "option_ui_title": {
-    "message": "AB Download Manager Extension"
+    "message": "WebDM Integration"
   },
   "connection_connected": {
     "message": "Connected"
@@ -126,7 +126,7 @@
     "message": "Test"
   },
   "note_about_app_must_be_installed_first": {
-    "message": "In order for this extension to work properly, make sure AB Download Manager is installed, if it doesn't..."
+    "message": "In order for this extension to work properly, make sure Web Download Manager (WebDM) is installed, if it doesn't..."
   },
   "download_abdm_app": {
     "message": "Download The App"
@@ -141,13 +141,13 @@
     "message": "Project Source Code"
   },
   "abdm_notification_title": {
-    "message": "AB Download Manager"
+    "message": "WebDM Integration"
   },
   "abdm_notification_download_captured_silently": {
     "message": "Download captured silently"
   },
   "download_media_title": {
-    "message": "Download With ABDM"
+    "message": "Download with WebDM"
   },
   "config_capture_file_size_limit_kb": {
     "message": "Capture file size minimum (KB)"

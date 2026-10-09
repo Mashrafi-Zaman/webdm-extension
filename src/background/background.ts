@@ -51,7 +51,7 @@ export default defineExtensionEntry()
             await initializeOptions()
             redirectDownloadLinksToMe()
             receiveMessageFromContentScripts()
-            console.log("ab dm extension loaded successfully")
+            console.log("WebDM Integration loaded successfully")
         } catch (e) {
             console.log("extension loading fail", e)
             throw e

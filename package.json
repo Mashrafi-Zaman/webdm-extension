@@ -1,11 +1,11 @@
 {
   "name": "ab-download-manager-browser-integration",
   "version": "1.5.0",
-  "displayName": "AB Download Manager Browser Integration",
+  "displayName": "WebDM Integration",
   "author": "AmirHossein Abdolmotallebi",
-  "description": "Download files with AB Download Manager app",
-  "repository": "https://github.com/amir1376/ab-download-manager-browser-integration",
-  "homepage": "https://abdownloadmanager.com",
+  "description": "Download files with the Web Download Manager (WebDM) app",
+  "repository": "https://github.com/Mashrafi-Zaman/webdm-extension",
+  "homepage": "https://github.com/Mashrafi-Zaman/webdm",
   "private": true,
   "license": "Apache-2.0",
   "scripts": {
