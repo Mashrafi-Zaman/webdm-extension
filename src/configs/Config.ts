@@ -71,6 +71,8 @@ const ConfigType = z.object({
     silentAddDownload: z.boolean().catch(false),
     silentStartDownload: z.boolean().catch(false),
     blacklistedUrls: z.array(z.string()).catch([]),
+    // popular sites (PopularSites.ts ids) WebDM is turned off for; all on by default
+    disabledSites: z.array(z.string()).catch([]),
     // minimum file size to capture in kilobytes. 0 = no minimum (capture all sizes)
     captureFileSizeMinimumKb: z.int().catch(0),
     bypassShortcut: z.string().catch(() => {

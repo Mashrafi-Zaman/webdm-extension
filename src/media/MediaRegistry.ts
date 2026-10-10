@@ -7,6 +7,8 @@ import * as HLSUtils from "~/media/HLSUtils"
 import {DefinedCommands} from "~/message/Commands";
 import {TabMediaStore} from "~/media/TabMediaStore";
 import type {ResourceProbeResult, SegmentProbeRequest, SegmentProbeResult} from "~/media/SegmentUtils";
+import * as Backend from "~/backend/Backend";
+import * as Configs from "~/configs/Config";
 
 type FrameRef = { tabId: number, frameId: number }
 
@@ -31,7 +33,8 @@ export class MediaRegistry implements OnMediaInterceptedFromRequestListener {
                         onDownloadableMediaProcessed(tabId, frameId, list)
                     }
                 }, this.store, (frameId, request) => probeFromPage(tabId, frameId, request),
-                    (frameId, url) => probeResourceFromPage(tabId, frameId, url))
+                    (frameId, url) => probeResourceFromPage(tabId, frameId, url),
+                    () => Backend.isJobTypeSupported("page"))
                 await mediaOnTab.restore()
                 return mediaOnTab
             })()
@@ -42,6 +45,14 @@ export class MediaRegistry implements OnMediaInterceptedFromRequestListener {
 
     /** Registers listeners synchronously; must be called at the top level of the background script. */
     boot() {
+        // e.g. a popular site turned off: hide (or show) its buttons right away
+        let lastDisabledSites = ""
+        Configs.onChanged.addEventListener((config) => {
+            const current = JSON.stringify(config.disabledSites)
+            if (current === lastDisabledSites) return
+            lastDisabledSites = current
+            this.tabs.forEach(p => p.then(m => m.publish()))
+        })
         browser.tabs.onRemoved.addListener(
             (tabId, _) => {
                 const page = this.tabs.get(tabId)
@@ -55,9 +66,16 @@ export class MediaRegistry implements OnMediaInterceptedFromRequestListener {
             (tabId, changeInfo, _) => {
                 if (changeInfo.status === "loading" || changeInfo.url) {
                     // new page: forget media of the previous one (in memory and in storage)
-                    this.tabs.get(tabId)?.then(p => p.reset())
+                    // (single-page sites like YouTube change the URL without loading: list again for the new page)
+                    this.tabs.get(tabId)?.then(p => {
+                        p.reset()
+                        if (changeInfo.url) p.publish()
+                    })
                     this.store.clear(tabId)
                     this.forgetFrames(ref => ref.tabId === tabId)
+                } else if (changeInfo.title) {
+                    // entries are named after the page title: list again when it changes
+                    this.tabs.get(tabId)?.then(p => p.publish())
                 }
             }
         )

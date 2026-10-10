@@ -21,5 +21,10 @@ export interface DownloadRequestItem {
     audio?: string | null,
     videoSize?: number | null,
     audioSize?: number | null,
+    // type "page" only, and only when the app allows it (capability "page.cookies"): that site's cookies
+    cookies?: {
+        name: string, value: string, domain: string, path: string,
+        secure: boolean, httpOnly: boolean, expirationDate: number | null,
+    }[],
 }
 export type DownloadRequestHeaders = Record<string, string>

@@ -15,7 +15,9 @@ import {TabMediaStore} from "~/media/TabMediaStore";
 import * as SegmentUtils from "~/media/SegmentUtils";
 import {SegmentTrack} from "~/media/SegmentUtils";
 import {redactHeaders} from "~/media/DetectionDebugLog";
-import {isSiteDownloaderSite, PAGE_DOWNLOAD_ENABLED} from "~/media/SiteDownloader";
+import {isPageOnlySite, isVideoPage} from "~/media/SiteDownloader";
+import {isSiteDisabled} from "~/configs/PopularSites";
+import * as Configs from "~/configs/Config";
 import {withPageHeaders} from "~/background/PageHeaders";
 
 // ---------- persisted (serializable) per-tab state ----------
@@ -281,6 +283,8 @@ export class MediaOnTab {
         private readonly pageProbe?: (frameId: number, request: SegmentUtils.SegmentProbeRequest) => Promise<SegmentUtils.SegmentProbeResult | null>,
         // full size / Range support of a file, requested from the frame's content script
         private readonly resourceProbe?: (frameId: number, url: string) => Promise<SegmentUtils.ResourceProbeResult | null>,
+        // does the app take {type:"page"} jobs (video pages read with yt-dlp)?
+        private readonly pageJobsSupported: () => Promise<boolean> = async () => false,
     ) {
     }
 
@@ -804,29 +808,44 @@ export class MediaOnTab {
     }
 
     /** Send each frame its current list (a frame that no longer has media gets an empty list). */
+    private publishSeq = 0
+
     async publish() {
         if (this.isClosed) {
             return
         }
+        // publishes overlap (they wait for the app's capabilities and the tab): only the newest one sends its lists,
+        // so an older one can't overwrite them with a stale title or state
+        const seq = ++this.publishSeq
+        const pageJobs = await this.pageJobsSupported().catch(() => false)
         const tab = await this.getTab()
+        if (this.isClosed || seq !== this.publishSeq) {
+            return
+        }
         const tabTitle = tab?.title
         const tabUrl = tab?.url
         if (!tabTitle || !tabUrl) {
             return
         }
-        const lists = buildDownloadableMediaLists(this.state, {
+        let lists = buildDownloadableMediaLists(this.state, {
             pageTitle: cleanPageTitle(tabTitle, tabUrl),
             pageUrlHash: shortSafeHash(tabUrl, 6),
+            pageJobs,
         })
-        if (PAGE_DOWNLOAD_ENABLED && isSiteDownloaderSite(tabUrl)) {
-            // "Download with WebDM (best)": the app's site downloader (yt-dlp) gets only the page URL
+        const siteDisabled = isSiteDisabled(tabUrl, Configs.getLatestConfig().disabledSites)
+        if (isPageOnlySite(tabUrl) || siteDisabled) {
+            lists = new Map() // e.g. YouTube: its own requests are only pieces of streams, never offered
+        }
+        if (pageJobs && isVideoPage(tabUrl) && !siteDisabled) {
+            // "Download with WebDM (best)": the app reads the page with yt-dlp (the exact video of this page, all its
+            // qualities); listed first, before what WebDM rebuilt from the page's requests
             const top = lists.get(0) ?? []
             top.unshift({
                 type: "page",
                 uri: tabUrl,
                 displayName: "Download with WebDM (best)",
                 suggestedFullName: cleanPageTitle(tabTitle, tabUrl),
-                note: "best quality, via the app's site downloader",
+                note: "this page's video, choose the quality in WebDM",
             })
             lists.set(0, top)
         }
@@ -1240,7 +1259,7 @@ function looksRandomName(name: string): boolean {
 
 // ---------- building the lists shown to the user ----------
 
-type PageInfo = { pageTitle: string, pageUrlHash: string }
+type PageInfo = { pageTitle: string, pageUrlHash: string, pageJobs?: boolean }
 
 function encryptionNote(encryption: HLSEncryption | undefined): string | undefined {
     switch (encryption) {
@@ -1326,8 +1345,9 @@ export function buildDownloadableMediaLists(state: TabMediaState, pageInfo: Page
                 duration: entry.duration !== undefined ? createDurationString(entry.duration) : undefined,
                 resolution: entry.maxHeight ? `up to ${entry.maxHeight}p` : undefined,
                 extension: "mpd",
-                note: "needs yt-dlp/ffmpeg",
-                downloadable: false,
+                // an app with yt-dlp downloads the manifest itself ({type:"page"} with the manifest URL)
+                note: pageInfo.pageJobs ? "downloaded with yt-dlp" : "needs yt-dlp/ffmpeg",
+                downloadable: pageInfo.pageJobs === true,
             })
         } else if (entry.kind === "http") {
             // MP4/audio fetched by a script in a frame that plays a stream are almost always that stream's segments

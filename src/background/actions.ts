@@ -7,6 +7,32 @@ import {defaultDownloadRequestOptions, DownloadRequestOptions} from "~/interface
 import {getLatestConfig} from "~/configs/Config";
 import {run} from "~/utils/ScopeFunctions";
 
+/**
+ * Video pages that need a login: attach that site's cookies to {type:"page"} jobs, only when the user allowed it in
+ * the app (capability "page.cookies", Settings > Tools > "Use browser cookies"). The app uses them only to read the
+ * page and never saves them; they are never logged here.
+ */
+async function withPageCookies(data: DownloadRequestItem[]): Promise<DownloadRequestItem[]> {
+    if (!data.some(item => item.type === "page")) return data
+    const capabilities = await backend.getAppCapabilities()
+    if (!capabilities?.features?.["page.cookies"] || !browser.cookies) return data
+    return Promise.all(data.map(async item => {
+        if (item.type !== "page") return item
+        try {
+            const cookies = await browser.cookies.getAll({url: item.link})
+            return {
+                ...item,
+                cookies: cookies.map(c => ({
+                    name: c.name, value: c.value, domain: c.domain, path: c.path,
+                    secure: c.secure, httpOnly: c.httpOnly, expirationDate: c.expirationDate ?? null,
+                })),
+            }
+        } catch (e) {
+            return item
+        }
+    }))
+}
+
 export async function addDownload(
     data: DownloadRequestItem[],
 ) {
@@ -17,6 +43,7 @@ export async function addDownload(
             return false
         }
     }
+    data = await withPageCookies(data)
     const config = getLatestConfig()
     const options: DownloadRequestOptions = {...defaultDownloadRequestOptions}
     if (config.silentAddDownload) {
