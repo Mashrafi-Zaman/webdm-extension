@@ -17,9 +17,8 @@ export function getManifestForChrome(): ManifestV3 {
     return {
         // as far as I know manifest version 3 does not allow request blocking
         manifest_version: 3,
-        // the pinned ID the app trusts for native messaging; the Chrome Web Store build leaves it out (the store
-        // rejects packages with a "key" and assigns its own ID)
-        ...(process.env.WEBDM_STORE_BUILD === "1" ? {} : {key: chromeExtensionPublicKey}),
+        // the pinned ID the app trusts for native messaging
+        key: chromeExtensionPublicKey,
         ...base,
         // also run in iframes whose URL has no origin of its own (about:blank, blob:, data:), using the
         // creator's origin for matching (Chrome only)

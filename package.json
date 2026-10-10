@@ -16,9 +16,7 @@
     "pack:src": "git archive HEAD -o ./dist/src.zip",
     "pack:chrome": "npm run build:chrome && web-ext build --source-dir ./dist/chrome --artifacts-dir ./dist --filename chrome.zip --overwrite-dest",
     "pack": "npm run pack:chrome && npm run pack:src",
-    "serve:chrome": "web-ext run -t chromium --start-url \"https://example.com\" --source-dir ./dist/chrome",
-    "build:chrome-store": "cross-env EXTENSION_TARGET=chrome WEBDM_STORE_BUILD=1 vite build",
-    "pack:chrome-store": "npm run build:chrome-store && web-ext build --source-dir ./dist/chrome --artifacts-dir ./dist --filename chrome-store.zip --overwrite-dest"
+    "serve:chrome": "web-ext run -t chromium --start-url \"https://example.com\" --source-dir ./dist/chrome"
   },
   "devDependencies": {
     "@samrum/vite-plugin-web-extension": "^5.1.1",
