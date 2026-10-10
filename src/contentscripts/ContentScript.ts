@@ -15,7 +15,7 @@ import {defineExtensionEntry} from "~/utils/DefineExtensionEntry";
 import ContentScriptEntryType from "~/utils/EntryPointTypes/ContentScript/ContentScriptEntryType";
 import {startPageMediaReporter} from "~/contentscripts/PageMediaReporter";
 import type {SegmentsTrackJob} from "~/media/MediaOnTab";
-import {segmentUrl} from "~/media/SegmentUtils";
+import {probeSegmentsWithFetch, segmentUrl} from "~/media/SegmentUtils";
 import _ from "lodash";
 
 const showPopupDelayed = debounce(500)
@@ -59,25 +59,41 @@ export default defineExtensionEntry()
                     return
                 }
                 if (addDownloadType === "segments" && media.segmentsJob) {
-                    // a stream rebuilt from its numbered segments: send the app one job with every segment URL
+                    // a stream rebuilt from its numbered segments: send the app one job with every segment URL,
+                    // but only to an app that supports it (never fall back to sending a single segment)
                     const job = media.segmentsJob
-                    const expand = (track: SegmentsTrackJob) => _.range(track.first, track.last + 1)
-                        .map(n => segmentUrl(track.template, n, track.pad))
-                    addDownloads([
-                        {
-                            link: media.uri,
-                            suggestedName: media.suggestedFullName ?? "",
-                            type: "segments",
-                            downloadPage: location.href,
-                            headers: job.headers,
-                            description: null,
-                            init: job.video.init ?? null,
-                            segments: expand(job.video),
-                            audioInit: job.audio?.init ?? null,
-                            audioSegments: job.audio ? expand(job.audio) : undefined,
+                    run(async () => {
+                        let supported = false
+                        try {
+                            supported = await sendMessage(DefinedCommands.IS_JOB_TYPE_SUPPORTED, "segments", "background")
+                        } catch (e) {
+                            supported = false
                         }
-                    ])
-                    MediaPopup.toggleList(false)
+                        if (!supported) {
+                            MediaPopup.showNotice(browser.i18n.getMessage("update_app_for_stream"))
+                            return
+                        }
+                        const expand = (track: SegmentsTrackJob) => _.range(track.first, track.last + 1)
+                            .map(n => segmentUrl(track.template, n, track.pad))
+                        await addDownloads([
+                            {
+                                link: media.uri,
+                                suggestedName: `${job.title}.${job.extension}`,
+                                type: "segments",
+                                downloadPage: location.href,
+                                headers: job.headers,
+                                description: null,
+                                init: job.video.init ?? null,
+                                segments: expand(job.video),
+                                audioInit: job.audio?.init ?? null,
+                                audioSegments: job.audio ? expand(job.audio) : undefined,
+                                duration: job.duration ?? null,
+                                estimatedSize: job.estimatedSize ?? null,
+                                quality: job.quality,
+                            }
+                        ])
+                        MediaPopup.toggleList(false)
+                    })
                     return
                 }
                 if (addDownloadType !== "hls" && addDownloadType !== "http") {
@@ -154,6 +170,10 @@ export default defineExtensionEntry()
             })
             onMessage(DefinedCommands.DOWNLOADABLE_MEDIA_DETECTED, (msg) => {
                 MediaPopup.updatePopup(msg.data)
+            })
+            onMessage(DefinedCommands.PROBE_SEGMENT_RANGE, async (msg) => {
+                // from the page: these requests carry the page's Referer / origin like the player's own
+                return await probeSegmentsWithFetch(msg.data, {referrer: location.href})
             })
             startPageMediaReporter()
         } catch (e) {

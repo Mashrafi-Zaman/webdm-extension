@@ -76,6 +76,10 @@ function receiveMessageFromContentScripts(
         // also re-send what we already know for this tab (restored from storage.session)
         await mediaRegistry.publish(tabId)
     })
+    onMessage(DefinedCommands.IS_JOB_TYPE_SUPPORTED, async (msg) => {
+        await whenBackgroundReady()
+        return await backend.isJobTypeSupported(msg.data)
+    })
     onMessage(DefinedCommands.EXPORT_DETECTION_LOG, async (msg) => {
         await whenBackgroundReady()
         return await exportDetectionLog(msg.data.tabId, mediaRegistry)

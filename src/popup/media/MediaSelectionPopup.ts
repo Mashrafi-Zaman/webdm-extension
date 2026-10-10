@@ -332,3 +332,24 @@ export function toggleList(
     }
     listContainer.style.display = listVisible ? "block" : "none"
 }
+
+/**
+ * A short message at the top of the list (e.g. "Update WebDM to download this stream"); the list opens so it's seen.
+ */
+export function showNotice(text: string) {
+    if (!popupEl) return
+    const listContainer = popupEl.querySelector<HTMLDivElement>(".abdm-media-list")
+    if (!listContainer) return
+    let notice = listContainer.querySelector<HTMLDivElement>(".abdm-media-notice")
+    if (!notice) {
+        notice = document.createElement("div")
+        notice.className = "abdm-media-notice"
+        notice.style.padding = "8px 12px"
+        notice.style.color = "#FF6A3D"
+        notice.style.fontWeight = "600"
+        notice.style.borderBottom = "rgba(255,255,255,0.1) solid 1px"
+        listContainer.prepend(notice)
+    }
+    notice.textContent = text
+    toggleList(true)
+}

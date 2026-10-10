@@ -178,5 +178,8 @@
   },
   "export_detection_log_failed": {
     "message": "Couldn't export the detection log"
+  },
+  "update_app_for_stream": {
+    "message": "Update WebDM to download this stream"
   }
 }

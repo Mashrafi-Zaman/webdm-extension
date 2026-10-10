@@ -6,6 +6,7 @@ import {DownloadableMedia} from "~/media/MediaOnTab";
 import type {Runtime} from "webextension-polyfill";
 import type {ReportedMedia} from "~/linkgrabber/DownloadLinkInterceptor";
 import type {PageDebugEvent} from "~/contentscripts/PageMediaReporter";
+import type {SegmentProbeRequest, SegmentProbeResult} from "~/media/SegmentUtils";
 
 declare module "webext-bridge" {
     export interface ProtocolMap {
@@ -32,5 +33,9 @@ declare module "webext-bridge" {
         }, void>,
         // toolbar popup -> background: save the detection log of a tab (debug mode); true if a download started
         export_detection_log: ProtocolWithReturn<{ tabId: number }, boolean>,
+        // can the app take /add items of this type (checked with GET /capabilities)?
+        is_job_type_supported: ProtocolWithReturn<string, boolean>,
+        // background -> content script: find the first/last segment number from the page (page Referer/origin)
+        probe_segment_range: ProtocolWithReturn<SegmentProbeRequest, SegmentProbeResult>,
     }
 }
