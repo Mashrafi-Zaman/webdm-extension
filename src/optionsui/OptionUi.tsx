@@ -22,6 +22,7 @@ import {createRoot} from "react-dom/client";
 import OptionUiEntryType from "~/utils/EntryPointTypes/OptionUi/OptionUiEntryType";
 import {isModifierKey, normalizeShortcut, parseShortcut} from "~/utils/Shortcut";
 import {isMac} from "~/utils/platform/Platform";
+import {popularSites} from "~/configs/PopularSites";
 
 class ToolsViewModelEvent {
 }
@@ -91,6 +92,18 @@ class ToolsViewModel extends EventAwareViewModel<ToolsViewModelEvent> implements
 
     @observable
     blacklistedUrls!: string[]
+
+    @observable
+    disabledSites!: string[]
+
+    setDisabledSites(siteIds: string[]) {
+        Configs.setConfigItem("disabledSites", [...new Set(siteIds)])
+    }
+
+    setSiteEnabled(siteId: string, enabled: boolean) {
+        const others = (this.disabledSites ?? []).filter(id => id !== siteId)
+        this.setDisabledSites(enabled ? others : [...others, siteId])
+    }
 
     @observable
     allowPassDownloadIfAppNotRespond!: boolean
@@ -279,6 +292,11 @@ const SettingsSection: React.FC<{ vm: ToolsViewModel }> = observer((props) => {
                 setBypassShortcut={(v) => vm.setShortCut(v)}
             />
             <Divider/>
+            <PopularSitesSection
+                disabledSites={vm.disabledSites ?? []}
+                setSiteEnabled={(id, enabled) => vm.setSiteEnabled(id, enabled)}
+            />
+            <Divider/>
             <ShowPopupSection value={vm.popupEnabled} toggle={(v) => vm.setPopupEnabled(v)}/>
             <Divider/>
             <SilentDownloadSection
@@ -337,6 +355,32 @@ function OptionItem(
             <div className="opacity-80">
                 {props.description}
             </div>
+        </div>
+    </div>
+}
+
+/** WebDM on/off per popular site (off = no button, no media detection, no download capture there) */
+function PopularSitesSection(
+    props: {
+        disabledSites: string[],
+        setSiteEnabled: (siteId: string, enabled: boolean) => void,
+    }
+) {
+    return <div className="flex flex-col space-y-4">
+        <div>{browser.i18n.getMessage("config_popular_sites")}</div>
+        <div className="opacity-80">{browser.i18n.getMessage("config_popular_sites_description")}</div>
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 px-4">
+            {popularSites().map(site => (
+                <label key={site.id} className="flex flex-row items-center space-x-2 cursor-pointer" data-site={site.id}>
+                    <input
+                        type="checkbox"
+                        className="checkbox checkbox-sm"
+                        checked={!props.disabledSites.includes(site.id)}
+                        onChange={event => props.setSiteEnabled(site.id, event.target.checked)}
+                    />
+                    <span>{site.name}</span>
+                </label>
+            ))}
         </div>
     </div>
 }

@@ -16,6 +16,8 @@ import * as SegmentUtils from "~/media/SegmentUtils";
 import {SegmentTrack} from "~/media/SegmentUtils";
 import {redactHeaders} from "~/media/DetectionDebugLog";
 import {isPageOnlySite, isVideoPage} from "~/media/SiteDownloader";
+import {isSiteDisabled} from "~/configs/PopularSites";
+import * as Configs from "~/configs/Config";
 import {withPageHeaders} from "~/background/PageHeaders";
 
 // ---------- persisted (serializable) per-tab state ----------
@@ -830,10 +832,11 @@ export class MediaOnTab {
             pageUrlHash: shortSafeHash(tabUrl, 6),
             pageJobs,
         })
-        if (isPageOnlySite(tabUrl)) {
+        const siteDisabled = isSiteDisabled(tabUrl, Configs.getLatestConfig().disabledSites)
+        if (isPageOnlySite(tabUrl) || siteDisabled) {
             lists = new Map() // e.g. YouTube: its own requests are only pieces of streams, never offered
         }
-        if (pageJobs && isVideoPage(tabUrl)) {
+        if (pageJobs && isVideoPage(tabUrl) && !siteDisabled) {
             // "Download with WebDM (best)": the app reads the page with yt-dlp (the exact video of this page, all its
             // qualities); listed first, before what WebDM rebuilt from the page's requests
             const top = lists.get(0) ?? []

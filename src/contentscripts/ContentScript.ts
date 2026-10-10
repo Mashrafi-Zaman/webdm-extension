@@ -17,6 +17,7 @@ import {startPageMediaReporter} from "~/contentscripts/PageMediaReporter";
 import type {SegmentsTrackJob} from "~/media/MediaOnTab";
 import {probeResourceWithFetch, probeSegmentsWithFetch, segmentUrl} from "~/media/SegmentUtils";
 import _ from "lodash";
+import {isSiteDisabled} from "~/configs/PopularSites";
 
 const showPopupDelayed = debounce(500)
 
@@ -37,7 +38,10 @@ async function checkAndReportLinks() {
 let lastSelectionConsumed = true
 
 function shouldCreatePopup() {
-    return lastSelectionConsumed && Configs.getLatestConfig().popupEnabled
+    const config = Configs.getLatestConfig()
+    // the user turned WebDM off for this site (options page, "Popular sites")
+    if (isSiteDisabled(location.href, config.disabledSites)) return false
+    return lastSelectionConsumed && config.popupEnabled
 }
 
 export default defineExtensionEntry()

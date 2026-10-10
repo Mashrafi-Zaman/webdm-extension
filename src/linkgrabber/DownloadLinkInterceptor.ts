@@ -8,6 +8,7 @@ import {Tabs, WebRequest} from "webextension-polyfill";
 import browser from "webextension-polyfill";
 import {isChrome} from "~/utils/ExtensionInfo";
 import urlMatch from "match-url-wildcard"
+import {disabledSitePatterns} from "~/configs/PopularSites";
 import {InterceptedMediaResult,} from "~/linkgrabber/LinkGrabberResponse";
 import * as DateUtils from "~/utils/DateUtils";
 
@@ -71,7 +72,9 @@ export abstract class DownloadLinkInterceptor {
     //utils
 
     protected isInConfigBlacklist(url: string) {
-        const blackList = Configs.getLatestConfig().blacklistedUrls
+        const config = Configs.getLatestConfig()
+        // the user's blacklist plus the popular sites they turned WebDM off for
+        const blackList = [...config.blacklistedUrls, ...disabledSitePatterns(config.disabledSites)]
         if (blackList.length == 0) {
             return false
         }

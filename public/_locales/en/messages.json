@@ -181,5 +181,11 @@
   },
   "update_app_for_stream": {
     "message": "Update WebDM to download this stream"
+  },
+  "config_popular_sites": {
+    "message": "Popular sites"
+  },
+  "config_popular_sites_description": {
+    "message": "Use WebDM on these sites. Turn a site off and WebDM does nothing there: no download button, no video detection and no download capture."
   }
 }

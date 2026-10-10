@@ -8,6 +8,7 @@ import {DefinedCommands} from "~/message/Commands";
 import {TabMediaStore} from "~/media/TabMediaStore";
 import type {ResourceProbeResult, SegmentProbeRequest, SegmentProbeResult} from "~/media/SegmentUtils";
 import * as Backend from "~/backend/Backend";
+import * as Configs from "~/configs/Config";
 
 type FrameRef = { tabId: number, frameId: number }
 
@@ -44,6 +45,14 @@ export class MediaRegistry implements OnMediaInterceptedFromRequestListener {
 
     /** Registers listeners synchronously; must be called at the top level of the background script. */
     boot() {
+        // e.g. a popular site turned off: hide (or show) its buttons right away
+        let lastDisabledSites = ""
+        Configs.onChanged.addEventListener((config) => {
+            const current = JSON.stringify(config.disabledSites)
+            if (current === lastDisabledSites) return
+            lastDisabledSites = current
+            this.tabs.forEach(p => p.then(m => m.publish()))
+        })
         browser.tabs.onRemoved.addListener(
             (tabId, _) => {
                 const page = this.tabs.get(tabId)
