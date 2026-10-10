@@ -2,7 +2,6 @@ import * as process from "process";
 
 export enum BrowserTarget{
     chrome = "chrome",
-    firefox = "firefox",
 }
 //lazy init
 let target:BrowserTarget
@@ -25,9 +24,6 @@ export function getExtensionBrowserTarget():BrowserTarget  {
     return target
 }
 
-export function isFirefox() {
-    return getExtensionBrowserTarget() === "firefox"
-}
 export function isChrome() {
     return getExtensionBrowserTarget() === "chrome"
 }

@@ -387,7 +387,49 @@
     }
 
     // ---------- MediaSource / SourceBuffer ----------
+    // each MediaSource gets a number, so the files one player plays (e.g. separate video and audio) are grouped
     var sourceBufferMime = new WeakMap();
+    var sourceBufferMediaSource = new WeakMap();
+    var mediaSourceIds = new WeakMap();
+    var nextMediaSourceId = 1;
+
+    function mediaSourceId(mediaSource) {
+        var id = mediaSourceIds.get(mediaSource);
+        if (!id) {
+            id = nextMediaSourceId++;
+            mediaSourceIds.set(mediaSource, id);
+        }
+        return id;
+    }
+
+    // picture height from an MP4 init segment ("tkhd" boxes end with width and height as 16.16 fixed point)
+    function heightFromInit(data) {
+        try {
+            var bytes = data instanceof ArrayBuffer ? new Uint8Array(data)
+                : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+            var limit = Math.min(bytes.length, 256 * 1024);
+            var best = 0;
+            for (var i = 4; i + 4 <= limit; i++) {
+                // "tkhd"
+                if (bytes[i] !== 0x74 || bytes[i + 1] !== 0x6b || bytes[i + 2] !== 0x68 || bytes[i + 3] !== 0x64) {
+                    continue;
+                }
+                var start = i - 4;
+                var size = ((bytes[start] << 24) >>> 0) + (bytes[start + 1] << 16) + (bytes[start + 2] << 8) + bytes[start + 3];
+                if (size < 84 || start + size > bytes.length) {
+                    continue;
+                }
+                var h = start + size - 4;
+                var height = ((bytes[h] << 8) | bytes[h + 1]);
+                if (height > best && height <= 8640) {
+                    best = height;
+                }
+            }
+            return best || null;
+        } catch (e) {
+            return null;
+        }
+    }
     var MS = window.MediaSource || window.ManagedMediaSource;
     if (MS && MS.prototype && MS.prototype.addSourceBuffer) {
         var originalAddSourceBuffer = MS.prototype.addSourceBuffer;
@@ -395,6 +437,7 @@
             var sourceBuffer = originalAddSourceBuffer.apply(this, arguments);
             try {
                 sourceBufferMime.set(sourceBuffer, String(mime));
+                sourceBufferMediaSource.set(sourceBuffer, this);
                 if (debugMode) {
                     report({kind: "debug", url: location.href, requestType: "mse", mime: String(mime), classification: "addSourceBuffer"}, false);
                 }
@@ -411,7 +454,15 @@
             try {
                 var url = urlForAppendedData(data);
                 if (url) {
-                    report({kind: "segment", url: url, mime: sourceBufferMime.get(this) || null}, true);
+                    var mediaSource = sourceBufferMediaSource.get(this);
+                    var duration = mediaSource && isFinite(mediaSource.duration) && mediaSource.duration > 0 ? mediaSource.duration : null;
+                    var mimeType = sourceBufferMime.get(this) || null;
+                    report({
+                        kind: "segment", url: url, mime: mimeType,
+                        ms: mediaSource ? mediaSourceId(mediaSource) : null,
+                        height: mimeType && /^video\//i.test(mimeType) ? heightFromInit(data) : null,
+                        duration: duration
+                    }, true);
                 }
             } catch (e) {
                 // ignore

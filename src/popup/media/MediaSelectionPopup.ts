@@ -229,6 +229,8 @@ function createMediaItemElement(item: DownloadableMedia) {
             size: q.size,
             note: q.note,
             segmentsJob: q.segmentsJob,
+            type: q.type ?? item.type,
+            avJob: q.avJob,
         } : item
         // textContent: the page title comes from the page and must not be parsed as HTML
         titleEl.textContent = selected.displayName ?? "Unnamed media"

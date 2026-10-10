@@ -19,7 +19,7 @@ import _ from "lodash";
 import * as BackgroundSharedState from "~/background/BackgroundSharedState";
 import * as HLSUtils from "~/media/HLSUtils";
 import {whenBackgroundReady} from "~/background/BackgroundReady";
-import {parseSegment} from "~/media/SegmentUtils";
+import {parseRangedRequest, parseSegment} from "~/media/SegmentUtils";
 import {isDebugEnabled, recordDetection} from "~/media/DetectionDebugLog";
 
 type TabInfo = {
@@ -575,6 +575,9 @@ export abstract class DownloadLinkInterceptor {
                 frameUrl: frameUrl,
                 content: item.content ?? undefined,
                 mime: item.mime ?? undefined,
+                mediaSource: item.mediaSource,
+                height: item.height,
+                mediaDuration: item.duration,
             })
         }
     }
@@ -672,6 +675,13 @@ export abstract class DownloadLinkInterceptor {
         if (HLSUtils.isDASHManifest(details.url, contentType)) {
             this.checkForStreamManifest(details, request?.finalRequest, "dash")
             return "dash"
+        }
+        // a byte range of a whole media file (bytestart/byteend, range=, or a Range header): one entry per file,
+        // never one per piece. Handled with the segments (no minimum size: the pieces can be tiny)
+        if (isMediaLikeResponse(details.type, contentType)
+            && parseRangedRequest(details.url, rangeHeader, getContentLength(getHeaders(details.responseHeaders)))) {
+            this.checkForSegment(details, request?.finalRequest, rangeHeader)
+            return "byte-range part"
         }
         // stream segments are never listed on their own; they're grouped to find or rebuild their stream
         const segment = parseSegment(details.url, contentType, rangeHeader)
@@ -823,11 +833,16 @@ export type ReportedMedia = {
     content?: string | null,
     // segment URLs the page appended to a MediaSource SourceBuffer of this mime type (from the page hook)
     mime?: string | null,
+    // segments from the page hook: which MediaSource (player) they went to, the picture height from an init
+    // segment, and the MediaSource duration (s)
+    mediaSource?: number,
+    height?: number,
+    duration?: number,
 }
 
 type RequestDetailsWithFrame = WebRequest.OnResponseStartedDetailsType & {
     initiator?: string, // chrome
-    documentUrl?: string, // firefox
+    documentUrl?: string,
 }
 
 function frameInfo(details: RequestDetailsWithFrame): { frameId: number, frameUrl?: string } {

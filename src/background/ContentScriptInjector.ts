@@ -9,7 +9,7 @@ import {IS_MV3} from "~/utils/ManifestUtil";
  * page where it's still alive.
  *
  * Also registers the MAIN-world page hook (public/webdm-page-hook.js), which spots playlists that players
- * fetch from URLs not ending in .m3u8 (or from blob: URLs). Chrome only: Firefox MV2 has no MAIN world.
+ * fetch from URLs not ending in .m3u8 (or from blob: URLs).
  */
 export function registerContentScriptInjection() {
     browser.runtime.onInstalled.addListener((details) => {

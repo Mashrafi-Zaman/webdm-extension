@@ -1,5 +1,4 @@
 
-<a href="https://addons.mozilla.org/en-US/firefox/addon/ab-download-manager/"><img src="https://img.shields.io/amo/v/ab-download-manager?label=Firefox&logo=firefoxbrowser" alt="Firefox Add-ons Version"></a>
 <a href="https://chromewebstore.google.com/detail/bbobopahenonfdgjgaleledndnnfhooj"> <img src="https://img.shields.io/chrome-web-store/v/bbobopahenonfdgjgaleledndnnfhooj?label=Chrome&logo=googlechrome" alt="Chrome Web Store Version"></a>
 
 # AB Download Manager Browser Integration Repository
@@ -22,9 +21,7 @@ In order to build this extension locally:
 # install dependencies
 npm i
 
-# for firefox
-npm run pack:firefox
-# for chrome
+# Chromium build (Chrome, Edge, Brave, Opera)
 npm run pack:chrome
 ```
 

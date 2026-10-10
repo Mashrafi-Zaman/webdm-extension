@@ -60,7 +60,7 @@ function classifyUrl(rawUrl: string): ReportedMedia["kind"] | null {
 
 function queue(item: ReportedMedia) {
     // MSE reports of the same URL may add the mime type later
-    const key = `${item.kind}:${item.url}:${item.mime ?? ""}`
+    const key = `${item.kind}:${item.url}:${item.mime ?? ""}:${item.mediaSource ?? ""}:${item.height ?? ""}:${item.duration ?? ""}`
     if (reported.has(key)) {
         return
     }
@@ -114,21 +114,30 @@ function scanResources() {
     }
 }
 
-function biggestVideo(): HTMLVideoElement | null {
+/**
+ * The video the user is watching: a playing, visible one (largest on screen), else the biggest. Feeds that preload
+ * the next videos (e.g. reels) have several; its duration tells which detected video is the one being watched.
+ */
+function mainVideo(): HTMLVideoElement | null {
     let best: HTMLVideoElement | null = null
-    let bestArea = -1
+    let bestScore = -1
     document.querySelectorAll("video").forEach(video => {
-        const area = video.clientWidth * video.clientHeight
-        if (area > bestArea) {
+        const rect = video.getBoundingClientRect()
+        const visibleWidth = Math.max(0, Math.min(rect.right, innerWidth) - Math.max(rect.left, 0))
+        const visibleHeight = Math.max(0, Math.min(rect.bottom, innerHeight) - Math.max(rect.top, 0))
+        const playing = !video.paused && !video.ended && video.readyState > 2
+        const area = visibleWidth * visibleHeight || video.clientWidth * video.clientHeight / 1000
+        const score = (playing ? 1e9 : 0) + area
+        if (score > bestScore) {
             best = video
-            bestArea = area
+            bestScore = score
         }
     })
     return best
 }
 
 function updateDuration() {
-    const duration = biggestVideo()?.duration
+    const duration = mainVideo()?.duration
     if (duration && Number.isFinite(duration) && duration > 0 && duration !== lastDuration) {
         lastDuration = duration
         durationChanged = true
@@ -155,6 +164,7 @@ function scanMediaElements() {
 
 type HookMessage = {
     url?: string, kind?: string, content?: string | null, mime?: string | null,
+    ms?: number | null, height?: number | null, duration?: number | null,
     requestType?: string, contentType?: string | null, size?: number | null, classification?: string | null,
 }
 
@@ -179,7 +189,12 @@ export function startPageMediaReporter() {
         if (data.kind === "hls" || data.kind === "dash") {
             queue({url: data.url, kind: data.kind, content: typeof data.content === "string" ? data.content : null})
         } else if (data.kind === "segment") {
-            queue({url: data.url, kind: "segment", mime: typeof data.mime === "string" ? data.mime : null})
+            queue({
+                url: data.url, kind: "segment", mime: typeof data.mime === "string" ? data.mime : null,
+                mediaSource: typeof data.ms === "number" ? data.ms : undefined,
+                height: typeof data.height === "number" ? data.height : undefined,
+                duration: typeof data.duration === "number" ? data.duration : undefined,
+            })
             debugEvent({source: "mse", url: data.url, mime: data.mime ?? undefined, classification: "appended to SourceBuffer"})
         } else if (data.kind === "debug") {
             debugEvent({
@@ -200,6 +215,8 @@ export function startPageMediaReporter() {
         }
     }, true)
     document.addEventListener("durationchange", updateDuration, true)
+    // another video starts playing (e.g. the next reel): it becomes the main one
+    document.addEventListener("playing", updateDuration, true)
 
     announce()
     // announce this frame (and let the background re-send what it knows), then report what's already loaded

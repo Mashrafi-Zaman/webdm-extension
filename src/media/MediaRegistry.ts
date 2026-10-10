@@ -6,7 +6,7 @@ import {sendMessage} from "webext-bridge/background";
 import * as HLSUtils from "~/media/HLSUtils"
 import {DefinedCommands} from "~/message/Commands";
 import {TabMediaStore} from "~/media/TabMediaStore";
-import type {SegmentProbeRequest, SegmentProbeResult} from "~/media/SegmentUtils";
+import type {ResourceProbeResult, SegmentProbeRequest, SegmentProbeResult} from "~/media/SegmentUtils";
 
 type FrameRef = { tabId: number, frameId: number }
 
@@ -30,7 +30,8 @@ export class MediaRegistry implements OnMediaInterceptedFromRequestListener {
                     onListUpdated(frameId: number, list: DownloadableMedia[]) {
                         onDownloadableMediaProcessed(tabId, frameId, list)
                     }
-                }, this.store, (frameId, request) => probeFromPage(tabId, frameId, request))
+                }, this.store, (frameId, request) => probeFromPage(tabId, frameId, request),
+                    (frameId, url) => probeResourceFromPage(tabId, frameId, url))
                 await mediaOnTab.restore()
                 return mediaOnTab
             })()
@@ -162,6 +163,18 @@ function originOf(url: string): string | null {
 }
 
 /** Ask the frame's content script to probe segment numbers (its requests carry the page's Referer). */
+async function probeResourceFromPage(tabId: number, frameId: number, url: string): Promise<ResourceProbeResult | null> {
+    try {
+        return await sendMessage(
+            DefinedCommands.PROBE_RESOURCE,
+            url,
+            {tabId: tabId, frameId: frameId, context: "content-script"},
+        )
+    } catch (e) {
+        return null
+    }
+}
+
 async function probeFromPage(tabId: number, frameId: number, request: SegmentProbeRequest): Promise<SegmentProbeResult | null> {
     try {
         return await sendMessage(
