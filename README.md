@@ -27,7 +27,7 @@ npm i
 npm run pack:chrome
 
 # Chrome Web Store build (YouTube support off)
-npm run build:chrome-store
+npm run pack:chrome-store   # dist/chrome-store.zip
 ```
 
 The extension is written to `./dist/chrome` (and `./dist/chrome.zip`); load it with "Load unpacked" in
