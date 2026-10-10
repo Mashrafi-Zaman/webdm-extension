@@ -827,7 +827,7 @@ export type ReportedMedia = {
 
 type RequestDetailsWithFrame = WebRequest.OnResponseStartedDetailsType & {
     initiator?: string, // chrome
-    documentUrl?: string, // firefox
+    documentUrl?: string,
 }
 
 function frameInfo(details: RequestDetailsWithFrame): { frameId: number, frameUrl?: string } {

@@ -3,7 +3,7 @@ import type {TabMediaState} from "~/media/MediaOnTab";
 
 /**
  * Keeps each tab's detected media in storage.session so it survives MV3 service-worker restarts.
- * Falls back to memory where storage.session is unavailable (older Firefox).
+ * Falls back to memory where storage.session is unavailable.
  * storage.session is cleared when the extension is reloaded/updated and when the browser restarts.
  */
 export class TabMediaStore {
