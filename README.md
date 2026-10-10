@@ -86,7 +86,7 @@ WebDM Integration has no analytics, no telemetry, no accounts and no server of i
   videos, the playlist or segment addresses. They go to `http://localhost:<port>` (15515 by default) or through
   native messaging to the app installed on the same machine.
 - **Video pages:** for *Download with WebDM (best)*, the site's cookies are attached only if you turned on
-  *Use browser cookies* in the app (Settings → Tools). The app uses them to read that page and doesn't save them.
+  *Use browser cookies for video sites* in the app (Settings → Tools). The app uses them to read that page and doesn't save them.
 - **Requests to the sites you visit:** to list qualities and sizes, the extension reads the same playlists and checks
   the size of the same video files the page is already playing, from the same servers.
 - **Stored in your browser:** settings in `storage.local`; the videos found in each tab in `storage.session`, which
