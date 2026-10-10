@@ -1,43 +1,46 @@
+# WebDM Integration
 
-<a href="https://chromewebstore.google.com/detail/bbobopahenonfdgjgaleledndnnfhooj"> <img src="https://img.shields.io/chrome-web-store/v/bbobopahenonfdgjgaleledndnnfhooj?label=Chrome&logo=googlechrome" alt="Chrome Web Store Version"></a>
+The browser extension for [WebDM (Web Download Manager)](https://github.com/Mashrafi-Zaman/webdm), for Chromium
+browsers (Chrome, Edge, Brave, Opera). Firefox is not supported.
 
-# AB Download Manager Browser Integration Repository
-
-> If you are looking for the main app repository, use [this link](https://github.com/amir1376/ab-download-manager).
 ## Usage
 
-In order to use this extension you need to [install](https://abdownloadmanager.com/#download) AB Download Manager.
+To use this extension you need the [WebDM app](https://github.com/Mashrafi-Zaman/webdm/releases/latest).
 
 ### This extension does the following
 
-- Adds a `Download With AB DM` in browser's context menu
-- Automatically captures download links when the user wants to download the file from their browser
-- Show a `Download Selected` popup when the user selects some section of the page that contains links
+- Adds `Download with WebDM` to the browser's context menu
+- Captures downloads (zip, exe, pdf, ...) and sends them to WebDM
+- Shows a `Download selected` popup when you select part of a page that contains links
+- Detects videos (direct files, HLS, streams rebuilt from segments, separate video + audio, players in iframes) and
+  shows a download button with one entry per video and its qualities
+- On video sites (YouTube, Facebook, Instagram ...) offers `Download with WebDM (best)`, which sends the page to the app
+  (yt-dlp); you can turn WebDM off per site in the options
 
 ## How To Build
-In order to build this extension locally:
-> I am developing this on `Windows` using `npm`, but it should have the same result on other build environments.
+
 ```bash
 # install dependencies
 npm i
 
 # Chromium build (Chrome, Edge, Brave, Opera)
 npm run pack:chrome
+
+# Chrome Web Store build (YouTube support off)
+npm run build:chrome-store
 ```
 
-The output zip file containing the extension will be placed at `./dist/<browser_name>.zip`.
+The extension is written to `./dist/chrome` (and `./dist/chrome.zip`); load it with "Load unpacked" in
+`chrome://extensions` (developer mode).
 
 ## Repositories And Source Code
 
-There are multiple repositories related to the **AB Download Manager** project:
+| Repository                                                                       | Description                                              |
+|----------------------------------------------------------------------------------|----------------------------------------------------------|
+| [WebDM](https://github.com/Mashrafi-Zaman/webdm)                                 | The **application** that runs on your **PC**             |
+| [WebDM Integration](https://github.com/Mashrafi-Zaman/webdm-extension) (You are here) | The **browser extension** to install in your **browser** |
 
-| Repository                                                                                                 | Description                                                                   |
-|------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------|
-| [Main Application](https://github.com/amir1376/ab-download-manager)                                        | Contains the  **Application** that runs on your  **device**                   |
-| [Browser Integration](https://github.com/amir1376/ab-download-manager-browser-integration)  (You are here) | Contains the **Browser Extension** to be installed on your  **browser**       |
-| [Website](https://github.com/amir1376/ab-download-manager-website)                                         | Contains the **AB Download Manager** [website](https://abdownloadmanager.com) |
-
-I spent a lot of time to create this project.
-
-If you like my work, Please consider giving it a ⭐.
-Thanks ❤️
+This extension is a modified fork of the
+[AB Download Manager browser integration](https://github.com/amir1376/ab-download-manager-browser-integration) by
+amir1376 (Apache License 2.0); see [NOTICE](NOTICE) and [LICENSE](LICENSE). It is not affiliated with or endorsed by the
+AB Download Manager project.
