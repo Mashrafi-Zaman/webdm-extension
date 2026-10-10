@@ -6,7 +6,7 @@ import {DownloadableMedia} from "~/media/MediaOnTab";
 import type {Runtime} from "webextension-polyfill";
 import type {ReportedMedia} from "~/linkgrabber/DownloadLinkInterceptor";
 import type {PageDebugEvent} from "~/contentscripts/PageMediaReporter";
-import type {SegmentProbeRequest, SegmentProbeResult} from "~/media/SegmentUtils";
+import type {ResourceProbeResult, SegmentProbeRequest, SegmentProbeResult} from "~/media/SegmentUtils";
 
 declare module "webext-bridge" {
     export interface ProtocolMap {
@@ -37,5 +37,7 @@ declare module "webext-bridge" {
         is_job_type_supported: ProtocolWithReturn<string, boolean>,
         // background -> content script: find the first/last segment number from the page (page Referer/origin)
         probe_segment_range: ProtocolWithReturn<SegmentProbeRequest, SegmentProbeResult>,
+        // background -> content script: full size / Range support of a file, requested from the page
+        probe_resource: ProtocolWithReturn<string, ResourceProbeResult | null>,
     }
 }

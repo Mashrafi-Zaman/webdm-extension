@@ -96,6 +96,14 @@ function detectTrack(text: string): SegmentTrack {
     return "unknown"
 }
 
+/** video / audio from URL naming (".../audio/...", "a1", "v1"), and a picture height ("720p") if the URL has one */
+export function urlHints(rawUrl: string): { track: SegmentTrack, height?: number } {
+    const parts = splitUrl(rawUrl)
+    if (!parts) return {track: "unknown"}
+    const text = parts.dir + parts.name
+    return {track: detectTrack(text), height: detectHeight(parts.name)}
+}
+
 /**
  * Parse a segment URL into its group. Returns null if it doesn't look like a segment.
  *   init-s1080p-v1-a1.mp4      -> init,           token "s1080p-v1-a1"
@@ -249,4 +257,134 @@ export async function probeSegmentsWithFetch(request: SegmentProbeRequest, init:
         }
     })
     return {...range, sizes}
+}
+
+// ---------- byte-range pieces of one whole file (e.g. DASH-style players without a visible manifest) ----------
+
+// query parameters that only select a byte range of the same file
+const BYTE_RANGE_PARAMS = ["bytestart", "byteend", "byte_start", "byte_end"]
+const WHOLE_MEDIA_EXTENSIONS = ["mp4", "m4v", "m4a", "mp4a", "webm", "weba", "mov", "mkv", "mp3", "aac", "ogg", "opus", "flac", "wav", ""]
+
+export type RangedRequest = {
+    // the file's URL without byte-range parameters: every piece of one file has the same one
+    url: string,
+    start?: number,
+    end?: number, // inclusive
+}
+
+/** Is the URL a stream segment by its name (seg-12.m4s, init-x.mp4, /segments/...)? */
+export function looksLikeSegmentName(rawUrl: string): boolean {
+    const parts = splitUrl(rawUrl)
+    if (!parts) return false
+    return SEGMENT_EXTENSIONS.includes(parts.extension)
+        || /\/segments?\//i.test(parts.dir)
+        || INIT_NAME.test(parts.name)
+        || NUMBERED_SEGMENT.test(parts.name)
+}
+
+function parseRangeValue(value: string | null): { start: number, end?: number } | null {
+    const m = value ? /^(?:bytes=)?(\d+)-(\d*)$/.exec(value.trim()) : null
+    return m ? {start: parseInt(m[1]), end: m[2] ? parseInt(m[2]) : undefined} : null
+}
+
+/**
+ * A request for a byte range of one whole media file, or null:
+ * - byte-range query parameters (bytestart/byteend, range=100-199, or start/end when [contentLength] shows that
+ *   they are byte offsets); the returned URL has them stripped
+ * - a bounded Range header on a whole-file URL (not a stream segment)
+ */
+export function parseRangedRequest(rawUrl: string, rangeHeader?: string | null, contentLength?: number | null): RangedRequest | null {
+    let url: URL
+    try {
+        url = new URL(rawUrl)
+    } catch (e) {
+        return null
+    }
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null
+    const params = url.searchParams
+    const lower = new Map<string, string>()
+    params.forEach((value, key) => lower.set(key.toLowerCase(), key))
+    const strip = (...names: string[]) => names.forEach(n => {
+        const key = lower.get(n)
+        if (key !== undefined) params.delete(key)
+    })
+    const numberParam = (name: string) => {
+        const key = lower.get(name)
+        const value = key !== undefined ? params.get(key) : null
+        return value !== null && /^\d+$/.test(value) ? parseInt(value) : undefined
+    }
+    let start: number | undefined
+    let end: number | undefined
+    let found = false
+    if (BYTE_RANGE_PARAMS.some(p => lower.has(p))) {
+        start = numberParam("bytestart") ?? numberParam("byte_start")
+        end = numberParam("byteend") ?? numberParam("byte_end")
+        strip(...BYTE_RANGE_PARAMS)
+        found = true
+    } else if (lower.has("range") && parseRangeValue(params.get(lower.get("range")!))) {
+        const r = parseRangeValue(params.get(lower.get("range")!))!
+        start = r.start
+        end = r.end
+        strip("range")
+        found = true
+    } else if (lower.has("start") && lower.has("end")) {
+        // could be seconds: only byte offsets when the response is exactly that long
+        const s = numberParam("start"), e = numberParam("end")
+        if (s !== undefined && e !== undefined && e >= s && contentLength && contentLength === e - s + 1) {
+            start = s
+            end = e
+            strip("start", "end")
+            found = true
+        }
+    }
+    if (found) {
+        return {url: url.toString(), start, end}
+    }
+    if (isBoundedRange(rangeHeader) && !looksLikeSegmentName(rawUrl)) {
+        const parts = splitUrl(rawUrl)
+        if (parts && WHOLE_MEDIA_EXTENSIONS.includes(parts.extension)) {
+            const r = parseRangeValue(rangeHeader!.replace(/\s+/g, ""))
+            return {url: rawUrl, start: r?.start, end: r?.end}
+        }
+    }
+    return null
+}
+
+/** Total size from "Content-Range: bytes 0-99/12345" */
+export function totalFromContentRange(contentRange: string | null | undefined): number | undefined {
+    const total = /\/(\d+)\s*$/.exec(contentRange ?? "")?.[1]
+    return total ? parseInt(total) : undefined
+}
+
+export type ResourceProbeResult = { size?: number, rangeSupported: boolean, contentType?: string }
+
+/** Full size of a file and whether its server answers Range requests (one "Range: bytes=0-0" request). */
+export async function probeResourceWithFetch(url: string, headers: Record<string, string> = {}, init: RequestInit = {}): Promise<ResourceProbeResult | null> {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 10_000)
+    try {
+        const requestHeaders: Record<string, string> = {}
+        Object.entries(headers).forEach(([k, v]) => {
+            if (k.toLowerCase() !== "range") requestHeaders[k] = v
+        })
+        requestHeaders["Range"] = "bytes=0-0"
+        const response = await fetch(url, {...init, headers: requestHeaders, signal: controller.signal})
+        const contentType = response.headers.get("Content-Type") ?? undefined
+        let result: ResourceProbeResult | null = null
+        if (response.status === 206) {
+            result = {size: totalFromContentRange(response.headers.get("Content-Range")), rangeSupported: true, contentType}
+        } else if (response.status === 200) {
+            result = {size: Number(response.headers.get("Content-Length")) || undefined, rangeSupported: false, contentType}
+        }
+        try {
+            await response.body?.cancel()
+        } catch (e) {
+            // ignore
+        }
+        return result
+    } catch (e) {
+        return null
+    } finally {
+        clearTimeout(timer)
+    }
 }

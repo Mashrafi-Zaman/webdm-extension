@@ -15,6 +15,8 @@ import {TabMediaStore} from "~/media/TabMediaStore";
 import * as SegmentUtils from "~/media/SegmentUtils";
 import {SegmentTrack} from "~/media/SegmentUtils";
 import {redactHeaders} from "~/media/DetectionDebugLog";
+import {isSiteDownloaderSite, PAGE_DOWNLOAD_ENABLED} from "~/media/SiteDownloader";
+import {withPageHeaders} from "~/background/PageHeaders";
 
 // ---------- persisted (serializable) per-tab state ----------
 
@@ -93,8 +95,30 @@ type SegmentGroup = {
     probe?: { status: "running" | "done" | "failed", first?: number, last?: number, atMax?: number, attempts?: number },
 }
 
+/**
+ * A whole media file the page fetches in byte ranges (bytestart/byteend, range=, Range header), e.g. the separate
+ * video and audio files of a DASH-style player without a visible manifest. One per file, never one per piece.
+ */
+type RangedResource = {
+    url: string, // without byte-range parameters
+    frameId: number,
+    headers: HeadersRecord,
+    track: SegmentTrack,
+    mime?: string, // MSE SourceBuffer type, e.g. 'video/mp4; codecs="avc1.64001f"'
+    contentType?: string,
+    mediaSource?: number, // the page's MediaSource (player) the bytes went to
+    height?: number,
+    duration?: number, // s, from the MediaSource
+    size?: number, // the full file, not a piece
+    rangeSupported?: boolean, // the server answers Range requests with 206
+    probe?: "running" | "done" | "failed",
+    pieces: number,
+}
+
 export type TabMediaState = {
     entries: Record<string, MediaEntry>,
+    // normalized URL -> file fetched in byte ranges
+    resources: Record<string, RangedResource>,
     // frameId -> URL of the document in that frame (as reported by its content script / requests)
     frames: Record<string, string>,
     segmentGroups: Record<string, SegmentGroup>,
@@ -103,7 +127,20 @@ export type TabMediaState = {
 }
 
 export function emptyTabMediaState(): TabMediaState {
-    return {entries: {}, frames: {}, segmentGroups: {}, frameDurations: {}}
+    return {entries: {}, resources: {}, frames: {}, segmentGroups: {}, frameDurations: {}}
+}
+
+/** Separate video and audio files of one video, sent to the app as {type: "av"} and merged there */
+export type AvJob = {
+    video: string,
+    audio: string,
+    // only when the server answers Range requests (the app then downloads parts in parallel)
+    videoSize?: number,
+    audioSize?: number,
+    headers: Record<string, string>,
+    title: string, // the file is named "<title>.mp4"
+    quality: string,
+    duration?: number,
 }
 
 /** A stream rebuilt from numbered segments, sent to the app as {type: "segments"} */
@@ -141,10 +178,14 @@ export type DownloadableMediaQuality = {
     size?: string,
     note?: string,
     segmentsJob?: SegmentsJob,
+    // set when it differs from the entry's type (e.g. a video-only quality of an "av" entry is plain "http")
+    type?: DownloadableMedia["type"],
+    avJob?: AvJob,
 }
 
 export type DownloadableMedia = {
-    type: InterceptedMediaType | "segments",
+    // "av": separate video + audio files (see AvJob); "page": only the page URL, for the app's site downloader
+    type: InterceptedMediaType | "segments" | "av" | "page",
     uri: string,
     requestHeaders?: Record<string, string>,
     displayName?: string
@@ -160,6 +201,7 @@ export type DownloadableMedia = {
     downloadable?: boolean,
     // type "segments": the stream rebuilt from its numbered segments
     segmentsJob?: SegmentsJob,
+    avJob?: AvJob,
     // for HLS master playlists: one entry per video, best quality first (uri/displayName above = qualities[0])
     qualities?: DownloadableMediaQuality[],
 }
@@ -169,10 +211,16 @@ export interface OnMedialListUpdated {
     onListUpdated(frameId: number, list: DownloadableMedia[]): void;
 }
 
+// request-specific headers that must not be replayed by the app (e.g. "Range: bytes=0-0" of a size probe would
+// make it download one byte)
+const NOT_REPLAYED_HEADERS = ["range", "if-range", "if-none-match", "if-modified-since", "content-length", "content-type"]
+
 function headersToRecord(headers: Headers): HeadersRecord {
     const record: HeadersRecord = {}
     headers.forEach((value, key) => {
-        record[key] = value
+        if (!NOT_REPLAYED_HEADERS.includes(key.toLowerCase())) {
+            record[key] = value
+        }
     })
     return record
 }
@@ -224,6 +272,8 @@ export class MediaOnTab {
         // probe segment numbers from the frame's content script (requests then carry the page's Referer / origin,
         // like the player's own); null if the frame can't be reached
         private readonly pageProbe?: (frameId: number, request: SegmentUtils.SegmentProbeRequest) => Promise<SegmentUtils.SegmentProbeResult | null>,
+        // full size / Range support of a file, requested from the frame's content script
+        private readonly resourceProbe?: (frameId: number, url: string) => Promise<SegmentUtils.ResourceProbeResult | null>,
     ) {
     }
 
@@ -235,8 +285,8 @@ export class MediaOnTab {
         if (fromPage && fromPage.last !== undefined) {
             return fromPage
         }
-        // the background can't send the page's Referer, so this works only where the server doesn't check it
-        return SegmentUtils.probeSegmentsWithFetch(request)
+        // from the background, with the page's Referer / Origin / User-Agent set by a session rule
+        return withPageHeaders(request.template, group.headers, () => SegmentUtils.probeSegmentsWithFetch(request))
     }
 
     /** Load persisted state, then finish any HLS work that was interrupted (e.g. by a service-worker restart). */
@@ -259,11 +309,17 @@ export class MediaOnTab {
                 }
             }
         }
-        // probes of segment groups interrupted by a service-worker restart
+        // probes of segment groups / files interrupted by a service-worker restart
         for (const group of Object.values(this.state.segmentGroups)) {
             if (group.probe?.status === "running") {
                 group.probe = undefined
                 this.maybeProbe(group, generation)
+            }
+        }
+        for (const resource of Object.values(this.state.resources)) {
+            if (resource.probe === "running") {
+                resource.probe = undefined
+                this.maybeProbeResource(resource, generation)
             }
         }
         await Promise.all(pending)
@@ -292,6 +348,7 @@ export class MediaOnTab {
         const redact = (headers: HeadersRecord) => redactHeaders(headers) ?? {}
         Object.values(copy.entries).forEach(e => e.requestHeaders = redact(e.requestHeaders))
         Object.values(copy.segmentGroups).forEach(g => g.headers = redact(g.headers))
+        Object.values(copy.resources ?? {}).forEach(r => r.headers = redact(r.headers))
         return copy
     }
 
@@ -311,6 +368,11 @@ export class MediaOnTab {
             for (const [groupKey, group] of Object.entries(this.state.segmentGroups)) {
                 if (group.frameId === frameId) {
                     delete this.state.segmentGroups[groupKey]
+                }
+            }
+            for (const [resourceUrl, resource] of Object.entries(this.state.resources)) {
+                if (resource.frameId === frameId) {
+                    delete this.state.resources[resourceUrl]
                 }
             }
             delete this.state.frameDurations[key]
@@ -341,6 +403,17 @@ export class MediaOnTab {
         const target = {
             frameId: frameId,
             headers: withReferer(headersToRecord(mediaResult.requestHeaders), frameUrl),
+        }
+        if (mediaResult.mediaType === "http" || mediaResult.mediaType === "segment") {
+            // a byte range of a whole file (or more bytes of a file we already know in pieces)
+            const ranged = SegmentUtils.parseRangedRequest(
+                mediaResult.url, mediaResult.rangeHeader, getContentLength(mediaResult.responseHeaders),
+            )
+            const key = ranged?.url ?? (this.state.resources[mediaResult.url] ? mediaResult.url : null)
+            if (key) {
+                await this.processRangePart(key, mediaResult, target, generation)
+                return
+            }
         }
         switch (mediaResult.mediaType) {
             case "hls":
@@ -471,6 +544,80 @@ export class MediaOnTab {
             await this.publish()
             // a group that waited because 3 probes were running
             Object.values(this.state.segmentGroups).forEach(g => this.maybeProbe(g, generation))
+        })
+    }
+
+    // ---------- whole files fetched in byte ranges ----------
+
+    private async processRangePart(url: string, mediaResult: InterceptedMediaResult, target: Target, generation: number) {
+        let resource = this.state.resources[url]
+        const isNew = !resource
+        if (!resource) {
+            resource = {url, frameId: target.frameId, headers: target.headers, track: "unknown", pieces: 0}
+            this.state.resources[url] = resource
+        }
+        const listed = () => JSON.stringify([resource.track, resource.mediaSource, resource.height, resource.duration, resource.size])
+        const before = listed()
+        resource.pieces++
+        // requests seen by webRequest carry the page's real headers; page-hook reports only a Referer
+        if (Object.keys(target.headers).length >= Object.keys(resource.headers).length) {
+            resource.headers = target.headers
+        }
+        const total = SegmentUtils.totalFromContentRange(mediaResult.responseHeaders.get("Content-Range"))
+        if (total) {
+            resource.size = total
+            resource.rangeSupported = true
+        }
+        if (mediaResult.mime) resource.mime = mediaResult.mime
+        if (mediaResult.mediaSource !== undefined) resource.mediaSource = mediaResult.mediaSource
+        if (mediaResult.height && mediaResult.height > (resource.height ?? 0)) resource.height = mediaResult.height
+        if (mediaResult.mediaDuration) resource.duration = mediaResult.mediaDuration
+        const contentType = getContentType(mediaResult.responseHeaders)
+        if (contentType && /^(video|audio)\//i.test(contentType)) resource.contentType = contentType
+        resource.track = rangedResourceTrack(resource)
+        this.scheduleSave()
+        this.maybeProbeResource(resource, generation)
+        if ((isNew || before !== listed()) && !this.isStale(generation)) {
+            await this.publish()
+        }
+    }
+
+    private runningResourceProbes = 0
+
+    /** The full size of a file and whether its server answers Range requests (one 1-byte request). */
+    private maybeProbeResource(resource: RangedResource, generation: number) {
+        if (resource.probe || (resource.size !== undefined && resource.rangeSupported !== undefined)) {
+            return
+        }
+        if (this.runningResourceProbes >= 3) {
+            return
+        }
+        resource.probe = "running"
+        this.runningResourceProbes++
+        run(async () => {
+            try {
+                // from the page first: the request then carries the page's Referer / cookies like the player's
+                const result = await this.resourceProbe?.(resource.frameId, resource.url).catch(() => null)
+                    ?? await withPageHeaders(resource.url, resource.headers,
+                        () => SegmentUtils.probeResourceWithFetch(resource.url, resource.headers))
+                if (this.isStale(generation)) return
+                if (result) {
+                    resource.size = result.size ?? resource.size
+                    resource.rangeSupported = result.rangeSupported
+                    if (result.contentType && /^(video|audio)\//i.test(result.contentType)) {
+                        resource.contentType ??= result.contentType
+                        resource.track = rangedResourceTrack(resource)
+                    }
+                }
+                resource.probe = result ? "done" : "failed"
+            } catch (e) {
+                resource.probe = "failed"
+            } finally {
+                this.runningResourceProbes--
+            }
+            this.scheduleSave()
+            await this.publish()
+            Object.values(this.state.resources).forEach(r => this.maybeProbeResource(r, generation))
         })
     }
 
@@ -652,7 +799,22 @@ export class MediaOnTab {
         if (!tabTitle || !tabUrl) {
             return
         }
-        const lists = buildDownloadableMediaLists(this.state, {pageTitle: tabTitle, pageUrlHash: shortSafeHash(tabUrl, 6)})
+        const lists = buildDownloadableMediaLists(this.state, {
+            pageTitle: cleanPageTitle(tabTitle, tabUrl),
+            pageUrlHash: shortSafeHash(tabUrl, 6),
+        })
+        if (PAGE_DOWNLOAD_ENABLED && isSiteDownloaderSite(tabUrl)) {
+            // "Download with WebDM (best)": the app's site downloader (yt-dlp) gets only the page URL
+            const top = lists.get(0) ?? []
+            top.unshift({
+                type: "page",
+                uri: tabUrl,
+                displayName: "Download with WebDM (best)",
+                suggestedFullName: cleanPageTitle(tabTitle, tabUrl),
+                note: "best quality, via the app's site downloader",
+            })
+            lists.set(0, top)
+        }
         const frames = new Set<number>([...lists.keys(), ...this.publishedFrames])
         for (const frameId of frames) {
             const list = lists.get(frameId) ?? []
@@ -821,6 +983,165 @@ function buildRebuiltStreams(
     }
 }
 
+// ---------- whole files fetched in byte ranges ----------
+
+// smaller files are left out (thumbnails, init pieces, probes) unless nothing else was found
+const MIN_LISTED_SIZE = 64 * 1024
+
+function rangedResourceTrack(resource: RangedResource): SegmentTrack {
+    // the MSE SourceBuffer type is the most reliable; servers often send "video/mp4" for audio files too
+    const fromType = (type: string | undefined): SegmentTrack | null => {
+        const t = type?.toLowerCase() ?? ""
+        if (t.startsWith("video/")) return "video"
+        if (t.startsWith("audio/")) return "audio"
+        return null
+    }
+    const hints = SegmentUtils.urlHints(resource.url)
+    return fromType(resource.mime)
+        ?? (fromType(resource.contentType) === "audio" ? "audio" : null)
+        ?? (hints.track !== "unknown" ? hints.track : null)
+        ?? fromType(resource.contentType)
+        ?? "unknown"
+}
+
+/**
+ * One entry per player (MediaSource) for files fetched in byte ranges: its video files are the qualities (high to
+ * low), paired with its best audio file. Files the page hook couldn't tie to a player are grouped per frame, but
+ * only in frames without such players.
+ */
+function buildRangedStreams(
+    state: TabMediaState,
+    pageInfo: PageInfo,
+    add: (frameId: number, item: DownloadableMedia) => void,
+    addTiny: (frameId: number, item: DownloadableMedia) => void,
+) {
+    const framesWithHls = new Set(Object.values(state.entries)
+        .filter(e => e.kind === "hls-master" || e.kind === "hls-media").map(e => e.frameId))
+    const resources = Object.values(state.resources ?? {}).filter(r =>
+        // a plain <video src> file is already listed as a file; HLS byte-range streams are listed as HLS
+        !state.entries[r.url] && !framesWithHls.has(r.frameId)
+    )
+    const framesWithPlayers = new Set(resources.filter(r => r.mediaSource !== undefined).map(r => r.frameId))
+    const groups = _.groupBy(
+        resources.filter(r => r.mediaSource !== undefined || !framesWithPlayers.has(r.frameId)),
+        r => r.mediaSource !== undefined ? `${r.frameId}:${r.mediaSource}` : `${r.frameId}:-`,
+    )
+    const entriesPerFrame = new Map<number, number>()
+    for (const members of Object.values(groups)) {
+        if (members.some(r => r.probe === "running")) continue // sizes still coming
+        const frameId = members[0].frameId
+        const frameUrl = state.frames[String(frameId)]
+        const isTiny = (r: RangedResource) => r.size !== undefined && r.size < MIN_LISTED_SIZE
+        const usable = members.filter(r => !isTiny(r))
+        const tinyOnly = usable.length === 0
+        const candidates = tinyOnly ? members : usable
+        const audios = candidates.filter(r => r.track === "audio")
+        let videos = candidates.filter(r => r.track !== "audio")
+        const audioOnly = videos.length === 0
+        if (audioOnly) videos = audios
+        const audio = audioOnly ? undefined : _.maxBy(audios, a => a.size ?? 0)
+        const index = (entriesPerFrame.get(frameId) ?? 0) + 1
+        entriesPerFrame.set(frameId, index)
+        // several videos in one frame (e.g. a feed): "<title>", "<title> (2)", ...
+        const title = index > 1 ? `${pageInfo.pageTitle} (${index})` : pageInfo.pageTitle
+        const sorted = _.orderBy(videos, [v => v.height ?? 0, v => v.size ?? 0], ["desc", "desc"])
+        const usedLabels = new Map<string, number>()
+        const qualities: DownloadableMediaQuality[] = sorted.map((video, i) => {
+            const duration = video.duration ?? audio?.duration ?? state.frameDurations[String(frameId)]
+            let label = video.height ? `${video.height}p`
+                : video.size && duration ? createBandwidthString(video.size * 8 / duration)
+                    : `Quality ${i + 1}`
+            const seen = usedLabels.get(label) ?? 0
+            usedLabels.set(label, seen + 1)
+            if (seen > 0) label = `${label} (${seen + 1})`
+            const size = video.size !== undefined ? video.size + (audio?.size ?? 0) : undefined
+            const headers = withReferer(video.headers, frameUrl)
+            const extension = audioOnly ? audioExtension(video) : "mp4"
+            return {
+                label,
+                uri: video.url,
+                requestHeaders: headers,
+                displayName: `${title} - ${label}`,
+                suggestedFullName: `${title}.${extension}`,
+                duration: duration ? createDurationString(duration) : undefined,
+                extension,
+                size: size !== undefined ? createSizeString(size) : undefined,
+                note: audio ? "video + audio" : audioOnly ? "audio" : undefined,
+                type: audio ? "av" : "http",
+                avJob: audio ? {
+                    video: video.url,
+                    audio: audio.url,
+                    videoSize: video.rangeSupported ? video.size : undefined,
+                    audioSize: audio.rangeSupported ? audio.size : undefined,
+                    headers,
+                    title,
+                    quality: label,
+                    duration: duration || undefined,
+                } : undefined,
+            }
+        })
+        if (!qualities.length) continue
+        const best = qualities[0]
+        const item: DownloadableMedia = {
+            type: best.type!,
+            uri: best.uri,
+            requestHeaders: best.requestHeaders,
+            displayName: best.displayName,
+            suggestedFullName: best.suggestedFullName,
+            duration: best.duration,
+            size: best.size,
+            extension: best.extension,
+            note: best.note,
+            avJob: best.avJob,
+            qualities,
+        }
+        if (tinyOnly) addTiny(frameId, item)
+        else add(frameId, item)
+    }
+}
+
+function audioExtension(resource: RangedResource): string {
+    const type = (resource.mime ?? resource.contentType ?? "").toLowerCase()
+    if (type.includes("webm")) return "weba"
+    if (type.includes("mpeg")) return "mp3"
+    return "m4a"
+}
+
+/**
+ * The page title as a file name: without notification counts ("(3) Facebook"); a bare site name ("Facebook")
+ * becomes "<Site> video <date>".
+ */
+export function cleanPageTitle(title: string, pageUrl: string): string {
+    const cleaned = title.replace(/^\(\d+\+?\)\s*/, "").trim()
+    let site = ""
+    try {
+        const host = new URL(pageUrl).hostname.replace(/^www\./, "")
+        const labels = host.split(".")
+        site = /^[\d.]+$|^\[|^localhost$/.test(host) ? "local"
+            : labels.length >= 2 ? labels[labels.length - 2] : labels[0]
+    } catch (e) {
+        // keep empty
+    }
+    const isBareSiteName = !cleaned || (site && cleaned.toLowerCase().replace(/\s+/g, "") === site.toLowerCase())
+    if (isBareSiteName) {
+        const name = site ? site.charAt(0).toUpperCase() + site.slice(1) : "Web"
+        return `${name} video ${new Date().toISOString().slice(0, 10)}`
+    }
+    return cleaned
+}
+
+/** A file name made of random URL tokens ("AQOi-tGy7mX9kQ2..."), not worth showing */
+function looksRandomName(name: string): boolean {
+    if (/\s/.test(name)) return false
+    return name.split(/[-_.]/).some(token => {
+        if (token.length < 12) return false
+        const lower = /[a-z]/.test(token), upper = /[A-Z]/.test(token), digit = /\d/.test(token)
+        // "tGy7mX9kQ2ab" (mixed case), or a long letters+digits id; not "bigbuckbunny720p" or "VeryLongWordName"
+        return (lower && upper && (digit || token.length >= 16 && /[a-z][A-Z].*[a-z][A-Z].*[a-z][A-Z]/.test(token)))
+            || (token.length >= 24 && digit && (lower || upper))
+    })
+}
+
 // ---------- building the lists shown to the user ----------
 
 type PageInfo = { pageTitle: string, pageUrlHash: string }
@@ -850,9 +1171,15 @@ export function buildDownloadableMediaLists(state: TabMediaState, pageInfo: Page
         }
         list.push(item)
     }
+    // tiny files (< 64 KB) are listed only in frames where nothing else was found
+    const tiny = new Map<number, DownloadableMedia[]>()
+    const addTiny = (frameId: number, item: DownloadableMedia) => {
+        tiny.set(frameId, [...(tiny.get(frameId) ?? []), item])
+    }
 
     // a frame that fetches stream segments plays a stream: whole MP4s fetched by its scripts are its segments too
     Object.values(state.segmentGroups).forEach(g => framesWithStreams.add(g.frameId))
+    Object.values(state.resources ?? {}).forEach(r => framesWithStreams.add(r.frameId))
     for (const entry of entries) {
         if (entry.kind === "hls-master" || entry.kind === "hls-media" || entry.kind === "dash") {
             framesWithStreams.add(entry.frameId)
@@ -911,14 +1238,16 @@ export function buildDownloadableMediaLists(state: TabMediaState, pageInfo: Page
             if (entry.viaScript && framesWithStreams.has(entry.frameId)) continue
             const mediaProps: string[] = []
             let name: string
-            if (entry.name) {
+            // never name it after random URL tokens
+            if (entry.name && !looksRandomName(entry.name)) {
                 name = entry.name
                 mediaProps.push(name)
             } else {
                 name = pageInfo.pageTitle
                 mediaProps.push(pageInfo.pageTitle, pageInfo.pageUrlHash)
             }
-            add(entry.frameId, {
+            const isTiny = entry.size !== undefined && entry.size < MIN_LISTED_SIZE
+            ;(isTiny ? addTiny : add)(entry.frameId, {
                 type: "http",
                 uri: entry.url,
                 requestHeaders: withReferer(entry.requestHeaders, state.frames[String(entry.frameId)]),
@@ -930,6 +1259,12 @@ export function buildDownloadableMediaLists(state: TabMediaState, pageInfo: Page
         }
     }
     buildRebuiltStreams(state, pageInfo, add)
+    buildRangedStreams(state, pageInfo, add, addTiny)
+    for (const [frameId, items] of tiny) {
+        if (!result.get(frameId)?.length) {
+            items.forEach(item => add(frameId, item))
+        }
+    }
     return result
 }
 
@@ -1115,7 +1450,8 @@ async function fetchHeadersOnly(url: string, requestHeaders: HeadersRecord): Pro
     if (!/^https?:/i.test(url)) {
         return null
     }
-    const response = await fetchWithTimeout(new Request(url, {method: "HEAD", headers: requestHeaders}), 8_000)
+    const response = await withPageHeaders(url, requestHeaders,
+        () => fetchWithTimeout(new Request(url, {method: "HEAD", headers: requestHeaders}), 8_000))
     if (!response || !inRange(response.status, 200, 299)) {
         return null
     }
@@ -1126,7 +1462,9 @@ async function fetchPlaylistText(url: string, requestHeaders: HeadersRecord, kin
     if (!/^https?:/i.test(url)) {
         return null // e.g. blob: playlists only arrive with their content
     }
-    const response = await fetchWithTimeout(new Request(url, {headers: requestHeaders}), 15_000)
+    // the page's Referer / Origin / User-Agent: many servers only serve playlists to their own pages
+    const response = await withPageHeaders(url, requestHeaders,
+        () => fetchWithTimeout(new Request(url, {headers: requestHeaders}), 15_000))
     if (!response) {
         return null
     }

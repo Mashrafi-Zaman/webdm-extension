@@ -15,7 +15,7 @@ import {defineExtensionEntry} from "~/utils/DefineExtensionEntry";
 import ContentScriptEntryType from "~/utils/EntryPointTypes/ContentScript/ContentScriptEntryType";
 import {startPageMediaReporter} from "~/contentscripts/PageMediaReporter";
 import type {SegmentsTrackJob} from "~/media/MediaOnTab";
-import {probeSegmentsWithFetch, segmentUrl} from "~/media/SegmentUtils";
+import {probeResourceWithFetch, probeSegmentsWithFetch, segmentUrl} from "~/media/SegmentUtils";
 import _ from "lodash";
 
 const showPopupDelayed = debounce(500)
@@ -92,6 +92,46 @@ export default defineExtensionEntry()
                                 quality: job.quality,
                             }
                         ])
+                        MediaPopup.toggleList(false)
+                    })
+                    return
+                }
+                if ((addDownloadType === "av" && media.avJob) || addDownloadType === "page") {
+                    // separate video + audio files merged by the app, or a page for the app's site downloader:
+                    // only for an app that supports the job type
+                    const job = media.avJob
+                    run(async () => {
+                        let supported = false
+                        try {
+                            supported = await sendMessage(DefinedCommands.IS_JOB_TYPE_SUPPORTED, addDownloadType, "background")
+                        } catch (e) {
+                            supported = false
+                        }
+                        if (!supported) {
+                            MediaPopup.showNotice(browser.i18n.getMessage("update_app_for_stream"))
+                            return
+                        }
+                        await addDownloads([job ? {
+                            link: job.video,
+                            suggestedName: `${job.title}.mp4`,
+                            type: "av",
+                            downloadPage: location.href,
+                            headers: job.headers,
+                            description: null,
+                            video: job.video,
+                            audio: job.audio,
+                            videoSize: job.videoSize ?? null,
+                            audioSize: job.audioSize ?? null,
+                            duration: job.duration ?? null,
+                            quality: job.quality,
+                        } : {
+                            link: media.uri,
+                            suggestedName: null,
+                            type: "page",
+                            downloadPage: location.href,
+                            headers: null,
+                            description: null,
+                        }])
                         MediaPopup.toggleList(false)
                     })
                     return
@@ -174,6 +214,9 @@ export default defineExtensionEntry()
             onMessage(DefinedCommands.PROBE_SEGMENT_RANGE, async (msg) => {
                 // from the page: these requests carry the page's Referer / origin like the player's own
                 return await probeSegmentsWithFetch(msg.data, {referrer: location.href})
+            })
+            onMessage(DefinedCommands.PROBE_RESOURCE, async (msg) => {
+                return await probeResourceWithFetch(msg.data, {}, {referrer: location.href})
             })
             startPageMediaReporter()
         } catch (e) {

@@ -18,4 +18,9 @@ export type InterceptedMediaResult = {
     // segments: Range header of the request, and the MSE SourceBuffer mime type the bytes went to (if known)
     rangeHeader?: string | null,
     mime?: string,
+    // from the page hook: the MediaSource (player) the bytes went to, picture height (from an init segment) and
+    // the MediaSource duration in seconds
+    mediaSource?: number,
+    height?: number,
+    mediaDuration?: number,
 }

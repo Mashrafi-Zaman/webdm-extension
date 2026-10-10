@@ -14,4 +14,5 @@ export const DefinedCommands = Object.freeze({
     EXPORT_DETECTION_LOG: "export_detection_log",
     IS_JOB_TYPE_SUPPORTED: "is_job_type_supported",
     PROBE_SEGMENT_RANGE: "probe_segment_range",
+    PROBE_RESOURCE: "probe_resource",
 })

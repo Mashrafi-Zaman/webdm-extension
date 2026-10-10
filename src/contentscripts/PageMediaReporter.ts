@@ -60,7 +60,7 @@ function classifyUrl(rawUrl: string): ReportedMedia["kind"] | null {
 
 function queue(item: ReportedMedia) {
     // MSE reports of the same URL may add the mime type later
-    const key = `${item.kind}:${item.url}:${item.mime ?? ""}`
+    const key = `${item.kind}:${item.url}:${item.mime ?? ""}:${item.mediaSource ?? ""}:${item.height ?? ""}:${item.duration ?? ""}`
     if (reported.has(key)) {
         return
     }
@@ -155,6 +155,7 @@ function scanMediaElements() {
 
 type HookMessage = {
     url?: string, kind?: string, content?: string | null, mime?: string | null,
+    ms?: number | null, height?: number | null, duration?: number | null,
     requestType?: string, contentType?: string | null, size?: number | null, classification?: string | null,
 }
 
@@ -179,7 +180,12 @@ export function startPageMediaReporter() {
         if (data.kind === "hls" || data.kind === "dash") {
             queue({url: data.url, kind: data.kind, content: typeof data.content === "string" ? data.content : null})
         } else if (data.kind === "segment") {
-            queue({url: data.url, kind: "segment", mime: typeof data.mime === "string" ? data.mime : null})
+            queue({
+                url: data.url, kind: "segment", mime: typeof data.mime === "string" ? data.mime : null,
+                mediaSource: typeof data.ms === "number" ? data.ms : undefined,
+                height: typeof data.height === "number" ? data.height : undefined,
+                duration: typeof data.duration === "number" ? data.duration : undefined,
+            })
             debugEvent({source: "mse", url: data.url, mime: data.mime ?? undefined, classification: "appended to SourceBuffer"})
         } else if (data.kind === "debug") {
             debugEvent({

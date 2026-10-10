@@ -29,7 +29,9 @@ export function getManifestForChrome(): ManifestV3 {
         host_permissions: getHostPermissions(),
         // "scripting": inject the content script into tabs that were open before install/update, and register
         // the MAIN-world page hook (webdm-page-hook.js)
-        permissions: [...getCommonPermissions(), "scripting"],
+        // "declarativeNetRequestWithHostAccess": the playlists/files the background fetches itself get the page's
+        // Referer / Origin / User-Agent (see PageHeaders.ts); no extra permission prompt beyond the host access
+        permissions: [...getCommonPermissions(), "scripting", "declarativeNetRequestWithHostAccess"],
     }
     /*return {
         manifest_version: 2,
