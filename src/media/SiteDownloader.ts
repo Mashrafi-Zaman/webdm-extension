@@ -4,9 +4,9 @@
  * supports "page" jobs.
  */
 
-// YouTube support (removed from the media blacklist, page button on watch/shorts). Off for a Chrome Web Store build:
-// `npm run build:chrome-store` sets WEBDM_STORE_BUILD=1.
-export const YOUTUBE_ENABLED = process.env.WEBDM_STORE_BUILD !== "1"
+// YouTube support (removed from the media blacklist, page button on watch/shorts). WebDM is not published on the
+// Chrome Web Store, so it is always on.
+export const YOUTUBE_ENABLED = true
 
 type SitePattern = { hosts: string[], path: RegExp, pageOnly?: boolean }
 

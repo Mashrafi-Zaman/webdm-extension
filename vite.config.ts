@@ -24,7 +24,7 @@ export default defineConfig(() => {
     },
     plugins: [
       react(),
-      EnvironmentPlugin({EXTENSION_TARGET: undefined, WEBDM_STORE_BUILD: "0"}),
+      EnvironmentPlugin({EXTENSION_TARGET: undefined}),
       webExtension({
         manifest: getManifest(),
       }) as PluginOption,
