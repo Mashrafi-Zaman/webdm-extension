@@ -12,4 +12,6 @@ export const DefinedCommands = Object.freeze({
     DOWNLOADABLE_MEDIA_DETECTED: "downloadable_media_detected",
     REPORT_FRAME_MEDIA: "report_frame_media",
     EXPORT_DETECTION_LOG: "export_detection_log",
+    IS_JOB_TYPE_SUPPORTED: "is_job_type_supported",
+    PROBE_SEGMENT_RANGE: "probe_segment_range",
 })

@@ -1,4 +1,4 @@
-import {IAppApi} from "~/backend/IAppApi";
+import {AppCapabilities, IAppApi} from "~/backend/IAppApi";
 import {AddDownloadRequest} from "~/interfaces/AddDownloadRequest";
 import _ from "lodash";
 
@@ -36,6 +36,10 @@ export class CompositeAppApi implements IAppApi {
 
     addDownload(request: AddDownloadRequest): Promise<boolean> {
         return this.action(api => api.addDownload(request))
+    }
+
+    getCapabilities(): Promise<AppCapabilities | null> {
+        return this.action(api => api.getCapabilities())
     }
 
     ping(): Promise<boolean> {

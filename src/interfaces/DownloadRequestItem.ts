@@ -11,5 +11,9 @@ export interface DownloadRequestItem {
     segments?: string[],
     audioInit?: string | null,
     audioSegments?: string[],
+    // type "segments": shown in the app's dialog
+    duration?: number | null,
+    estimatedSize?: number | null,
+    quality?: string | null,
 }
 export type DownloadRequestHeaders = Record<string, string>

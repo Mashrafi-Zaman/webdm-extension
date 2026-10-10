@@ -1,7 +1,7 @@
 import isNetworkError from "is-network-error";
 import {HttpApiError, NetworkError} from "~/backend/BackendError";
 import {AddDownloadRequest} from "~/interfaces/AddDownloadRequest";
-import {IAppApi} from "~/backend/IAppApi";
+import {AppCapabilities, IAppApi} from "~/backend/IAppApi";
 import {getLatestConfig} from "~/configs/Config";
 import {isNullOrBlank} from "~/utils/StringUtils";
 import {head} from "lodash";
@@ -23,6 +23,7 @@ export class HttpApi implements IAppApi {
     private async request(
         path: string,
         payload: any,
+        method: "GET" | "POST" = "POST",
     ) {
         const apiKey = getLatestConfig().apiKey
         const headers: HeadersInit = {}
@@ -35,9 +36,9 @@ export class HttpApi implements IAppApi {
         let response: Response
         try {
             response = await fetch(this.apiUrl + path, {
-                method: "POST",
+                method: method,
                 headers: headers,
-                body: JSON.stringify(payload),
+                body: method === "GET" ? undefined : JSON.stringify(payload),
                 signal: controller.signal,
             })
         } catch (e) {
@@ -63,5 +64,18 @@ export class HttpApi implements IAppApi {
     async ping(): Promise<boolean> {
         await this.request("ping", null)
         return true
+    }
+
+    async getCapabilities(): Promise<AppCapabilities | null> {
+        try {
+            const response = await this.request("capabilities", null, "GET")
+            return await response.json() as AppCapabilities
+        } catch (e) {
+            // an app without /capabilities (older WebDM) can't download the newer job types
+            if (e instanceof HttpApiError && e.response.status === 404) {
+                return null
+            }
+            throw e
+        }
     }
 }

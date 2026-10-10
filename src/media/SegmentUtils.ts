@@ -163,3 +163,90 @@ export function segmentUrl(template: string, n: number, pad?: number): string {
     const text = pad ? String(n).padStart(pad, "0") : String(n)
     return template.replace("{N}", text)
 }
+
+export type SegmentProbeRequest = { template: string, pad?: number, min: number, max: number, headers?: Record<string, string> }
+export type SegmentProbeResult = { first?: number, last?: number, sizes: number[] }
+
+/**
+ * First and last segment number of a numbered stream: exponential then binary search with [exists]
+ * (at most 64 checks). Shared by the content script (probes from the page, so the page's Referer/cookies apply)
+ * and the background (fallback).
+ */
+export async function findSegmentRange(
+    min: number,
+    max: number,
+    exists: (n: number) => Promise<boolean>,
+): Promise<{ first?: number, last?: number }> {
+    let checks = 0
+    const check = async (n: number) => {
+        if (n < 0 || checks >= 64) return false
+        checks++
+        return exists(n)
+    }
+    if (!(await check(max))) {
+        // the URL pattern doesn't work outside the player (e.g. per-segment signed URLs)
+        return {}
+    }
+    let lo = max
+    let hi: number | undefined
+    for (let step = 1; hi === undefined && checks < 40; step *= 2) {
+        if (await check(lo + step)) lo = lo + step
+        else hi = lo + step
+    }
+    hi ??= lo + 1
+    while (hi - lo > 1 && checks < 64) {
+        const mid = Math.floor((lo + hi) / 2)
+        if (await check(mid)) lo = mid
+        else hi = mid
+    }
+    // first: usually 0 or 1, otherwise the smallest number that exists below what the player fetched
+    let first = min
+    if (min > 0) {
+        if (await check(0)) {
+            first = 0
+        } else if (min > 1 && await check(1)) {
+            first = 1
+        } else if (min > 1) {
+            let a = 1, b = min
+            while (b - a > 1 && checks < 64) {
+                const mid = Math.floor((a + b) / 2)
+                if (await check(mid)) b = mid
+                else a = mid
+            }
+            first = b
+        }
+    }
+    return {first, last: lo}
+}
+
+/** Probe with fetch + "Range: bytes=0-0" (1 byte per check); collects segment sizes from Content-Range. */
+export async function probeSegmentsWithFetch(request: SegmentProbeRequest, init: RequestInit = {}): Promise<SegmentProbeResult> {
+    const sizes: number[] = []
+    const range = await findSegmentRange(request.min, request.max, async (n) => {
+        const controller = new AbortController()
+        const timer = setTimeout(() => controller.abort(), 10_000)
+        try {
+            const headers: Record<string, string> = {}
+            Object.entries(request.headers ?? {}).forEach(([k, v]) => {
+                if (k.toLowerCase() !== "range") headers[k] = v
+            })
+            headers["Range"] = "bytes=0-0"
+            const response = await fetch(segmentUrl(request.template, n, request.pad), {...init, headers, signal: controller.signal})
+            if (!(response.status === 200 || response.status === 206)) return false
+            const total = /\/(\d+)\s*$/.exec(response.headers.get("Content-Range") ?? "")?.[1]
+            const size = total ? parseInt(total) : (response.status === 200 ? Number(response.headers.get("Content-Length")) || 0 : 0)
+            if (size) sizes.push(size)
+            try {
+                await response.body?.cancel()
+            } catch (e) {
+                // ignore
+            }
+            return true
+        } catch (e) {
+            return false
+        } finally {
+            clearTimeout(timer)
+        }
+    })
+    return {...range, sizes}
+}

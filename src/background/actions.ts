@@ -10,6 +10,13 @@ import {run} from "~/utils/ScopeFunctions";
 export async function addDownload(
     data: DownloadRequestItem[],
 ) {
+    // never send a job type the app doesn't understand (e.g. a rebuilt stream to an older WebDM): it would
+    // fail, or worse, end up as a plain download of the first URL (just the init segment)
+    for (const type of new Set(data.map(item => item.type))) {
+        if (!await backend.isJobTypeSupported(type)) {
+            return false
+        }
+    }
     const config = getLatestConfig()
     const options: DownloadRequestOptions = {...defaultDownloadRequestOptions}
     if (config.silentAddDownload) {

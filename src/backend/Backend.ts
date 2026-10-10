@@ -4,7 +4,7 @@ import * as Configs from "~/configs/Config"
 import {DownloadRequestItem} from "~/interfaces/DownloadRequestItem";
 import {DownloadRequestOptions} from "~/interfaces/DownloadRequestOptions";
 import Constants from "~/utils/Constants";
-import {IAppApi} from "~/backend/IAppApi";
+import {AppCapabilities, IAppApi} from "~/backend/IAppApi";
 import {NativeMessagingApi} from "~/backend/NativeMessagingApi";
 import {NativeMessagingTransport} from "~/backend/nativemessaging/NativeMessagingTransport";
 import {CompositeAppApi} from "~/backend/CompositeAppApi";
@@ -38,6 +38,8 @@ export function boot() {
         run(async () => {
             const port = (event.port)
             httpApi = createHttpApiClient(port)
+            // another port / API key may be another app version: ask again
+            capabilitiesCache = null
         })
     })
     // test native messaging in the background; until it finishes, requests fall back to HTTP
@@ -135,3 +137,32 @@ export async function nativeMessagingPing() {
 }
 
 
+
+// ---------- what the app can download (GET /capabilities) ----------
+let capabilitiesCache: { value: AppCapabilities | null, at: number } | null = null
+const CAPABILITIES_TTL_MS = 30_000
+
+/** The app's capabilities (cached 30 s); null if the app is too old to report them or isn't reachable. */
+export async function getAppCapabilities(): Promise<AppCapabilities | null> {
+    if (capabilitiesCache && Date.now() - capabilitiesCache.at < CAPABILITIES_TTL_MS) {
+        return capabilitiesCache.value
+    }
+    let value: AppCapabilities | null = null
+    try {
+        value = await getApi().getCapabilities()
+    } catch (e) {
+        // not reachable: don't cache, try again next time
+        return null
+    }
+    capabilitiesCache = {value, at: Date.now()}
+    return value
+}
+
+/** Can the app take /add items of this type? "http" and "hls" work with every WebDM version. */
+export async function isJobTypeSupported(type: string): Promise<boolean> {
+    if (type === "http" || type === "hls") {
+        return true
+    }
+    const capabilities = await getAppCapabilities()
+    return capabilities?.jobTypes?.includes(type) ?? false
+}

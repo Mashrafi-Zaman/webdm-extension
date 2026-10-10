@@ -6,6 +6,7 @@ import {sendMessage} from "webext-bridge/background";
 import * as HLSUtils from "~/media/HLSUtils"
 import {DefinedCommands} from "~/message/Commands";
 import {TabMediaStore} from "~/media/TabMediaStore";
+import type {SegmentProbeRequest, SegmentProbeResult} from "~/media/SegmentUtils";
 
 type FrameRef = { tabId: number, frameId: number }
 
@@ -29,7 +30,7 @@ export class MediaRegistry implements OnMediaInterceptedFromRequestListener {
                     onListUpdated(frameId: number, list: DownloadableMedia[]) {
                         onDownloadableMediaProcessed(tabId, frameId, list)
                     }
-                }, this.store)
+                }, this.store, (frameId, request) => probeFromPage(tabId, frameId, request))
                 await mediaOnTab.restore()
                 return mediaOnTab
             })()
@@ -155,6 +156,19 @@ function originOf(url: string): string | null {
     try {
         const origin = new URL(url).origin
         return origin && origin !== "null" ? origin : null
+    } catch (e) {
+        return null
+    }
+}
+
+/** Ask the frame's content script to probe segment numbers (its requests carry the page's Referer). */
+async function probeFromPage(tabId: number, frameId: number, request: SegmentProbeRequest): Promise<SegmentProbeResult | null> {
+    try {
+        return await sendMessage(
+            DefinedCommands.PROBE_SEGMENT_RANGE,
+            request,
+            {tabId: tabId, frameId: frameId, context: "content-script"},
+        )
     } catch (e) {
         return null
     }

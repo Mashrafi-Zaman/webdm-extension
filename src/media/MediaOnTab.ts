@@ -89,7 +89,8 @@ type SegmentGroup = {
     token: string,
     headers: HeadersRecord,
     sizes: number[], // sample of segment sizes (bytes)
-    probe?: { status: "running" | "done" | "failed", first?: number, last?: number },
+    // atMax: the highest segment number seen when it ran; attempts: how often it ran
+    probe?: { status: "running" | "done" | "failed", first?: number, last?: number, atMax?: number, attempts?: number },
 }
 
 export type TabMediaState = {
@@ -117,6 +118,12 @@ export type SegmentsJob = {
     video: SegmentsTrackJob,
     audio?: SegmentsTrackJob,
     headers: Record<string, string>,
+    // for the app's dialog: the file is named "<title>.<extension>"
+    title: string,
+    quality: string,
+    extension: string,
+    duration?: number, // seconds
+    estimatedSize?: number, // bytes
 }
 
 // ---------- what the content script receives ----------
@@ -214,7 +221,22 @@ export class MediaOnTab {
         public readonly tabId: number,
         private readonly onMediaListUpdated: OnMedialListUpdated,
         private readonly store: TabMediaStore,
+        // probe segment numbers from the frame's content script (requests then carry the page's Referer / origin,
+        // like the player's own); null if the frame can't be reached
+        private readonly pageProbe?: (frameId: number, request: SegmentUtils.SegmentProbeRequest) => Promise<SegmentUtils.SegmentProbeResult | null>,
     ) {
+    }
+
+    private async probe(group: SegmentGroup): Promise<SegmentUtils.SegmentProbeResult> {
+        const request: SegmentUtils.SegmentProbeRequest = {
+            template: group.template!, pad: group.pad, min: group.min!, max: group.max!, headers: group.headers,
+        }
+        const fromPage = await this.pageProbe?.(group.frameId, {...request, headers: undefined}).catch(() => null)
+        if (fromPage && fromPage.last !== undefined) {
+            return fromPage
+        }
+        // the background can't send the page's Referer, so this works only where the server doesn't check it
+        return SegmentUtils.probeSegmentsWithFetch(request)
     }
 
     /** Load persisted state, then finish any HLS work that was interrupted (e.g. by a service-worker restart). */
@@ -390,7 +412,8 @@ export class MediaOnTab {
             group.headers = target.headers
         }
         const size = getContentLength(mediaResult.responseHeaders)
-        if (size && group.sizes.length < 20 && !parsed.isInit) {
+        // a range response (e.g. our own 1-byte probes) doesn't tell the segment's size
+        if (size && group.sizes.length < 20 && !parsed.isInit && !SegmentUtils.isBoundedRange(mediaResult.rangeHeader)) {
             group.sizes.push(size)
         }
         if (mediaResult.mime) {
@@ -412,7 +435,12 @@ export class MediaOnTab {
 
     /** Work out the first and last segment number of a numbered group by probing the server. */
     private maybeProbe(group: SegmentGroup, generation: number) {
-        if (group.probe || !group.template || group.max === undefined) {
+        if (!group.template || group.max === undefined) {
+            return
+        }
+        // a failed probe is tried again (up to 3 times) once the player fetched further segments
+        const retry = group.probe?.status === "failed" && (group.probe.attempts ?? 1) < 3 && group.max > (group.probe.atMax ?? 0)
+        if (group.probe && !retry) {
             return
         }
         // one segment alone could be anything; an init segment or a second segment makes it a stream
@@ -422,18 +450,20 @@ export class MediaOnTab {
         if (hasManifestFor(group, this.state) || this.runningProbes >= 3) {
             return
         }
-        group.probe = {status: "running"}
+        const attempts = (group.probe?.attempts ?? 0) + 1
+        const atMax = group.max
+        group.probe = {status: "running", attempts, atMax}
         this.runningProbes++
         run(async () => {
             try {
-                const result = await probeSegmentRange(group)
+                const result = await this.probe(group)
                 if (this.isStale(generation)) return
                 group.probe = result.last !== undefined
-                    ? {status: "done", first: result.first, last: result.last}
-                    : {status: "failed"}
+                    ? {status: "done", first: result.first, last: result.last, attempts, atMax}
+                    : {status: "failed", attempts, atMax}
                 result.sizes.forEach(s => group.sizes.length < 20 && group.sizes.push(s))
             } catch (e) {
-                group.probe = {status: "failed"}
+                group.probe = {status: "failed", attempts, atMax}
             } finally {
                 this.runningProbes--
             }
@@ -692,75 +722,6 @@ function hasManifestFor(group: SegmentGroup, state: TabMediaState): boolean {
     return false
 }
 
-/**
- * First and last segment number of a numbered group, by probing the server with 1-byte range requests
- * (exponential then binary search; at most 64 requests), using the page's request headers.
- */
-async function probeSegmentRange(group: SegmentGroup): Promise<{ first?: number, last?: number, sizes: number[] }> {
-    const sizes: number[] = []
-    let requests = 0
-    const headers: HeadersRecord = {}
-    Object.entries(group.headers).forEach(([k, v]) => {
-        if (k.toLowerCase() !== "range") headers[k] = v
-    })
-    headers["Range"] = "bytes=0-0"
-    const exists = async (n: number): Promise<boolean> => {
-        if (n < 0 || requests >= 64) return false
-        requests++
-        const response = await fetchWithTimeout(
-            new Request(SegmentUtils.segmentUrl(group.template!, n, group.pad), {headers}), 10_000,
-        )
-        if (!response || !(response.status === 200 || response.status === 206)) return false
-        const total = /\/(\d+)\s*$/.exec(response.headers.get("Content-Range") ?? "")?.[1]
-        const size = total ? parseInt(total) : (response.status === 200 ? getContentLength(response.headers) : null)
-        if (size) sizes.push(size)
-        try {
-            await response.body?.cancel()
-        } catch (e) {
-            // ignore
-        }
-        return true
-    }
-    const min = group.min!, max = group.max!
-    if (!(await exists(max))) {
-        // the URL pattern doesn't work outside the player (e.g. per-segment signed URLs)
-        return {sizes}
-    }
-    let lo = max
-    let hi: number | undefined
-    for (let step = 1; hi === undefined && requests < 40; step *= 2) {
-        if (await exists(lo + step)) {
-            lo = lo + step
-        } else {
-            hi = lo + step
-        }
-    }
-    hi ??= lo + 1
-    while (hi - lo > 1 && requests < 64) {
-        const mid = Math.floor((lo + hi) / 2)
-        if (await exists(mid)) lo = mid
-        else hi = mid
-    }
-    // first: usually 0 or 1, otherwise the smallest number that exists below what the player fetched
-    let first = min
-    if (min > 0) {
-        if (await exists(0)) {
-            first = 0
-        } else if (min > 1 && await exists(1)) {
-            first = 1
-        } else if (min > 1) {
-            let a = 1, b = min
-            while (b - a > 1 && requests < 64) {
-                const mid = Math.floor((a + b) / 2)
-                if (await exists(mid)) b = mid
-                else a = mid
-            }
-            first = b
-        }
-    }
-    return {first, last: lo, sizes}
-}
-
 function trackJob(group: SegmentGroup): SegmentsTrackJob {
     return {
         init: group.initUrl,
@@ -834,6 +795,11 @@ function buildRebuiltStreams(
                     video: job,
                     audio: audioJob,
                     headers: withReferer(group.headers, frameUrl),
+                    title: pageInfo.pageTitle,
+                    quality: label,
+                    extension: extension,
+                    duration: duration || undefined,
+                    estimatedSize: size ? Math.round(size) : undefined,
                 },
             }
         })

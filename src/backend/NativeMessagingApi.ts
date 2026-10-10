@@ -1,4 +1,4 @@
-import {IAppApi} from "~/backend/IAppApi";
+import {AppCapabilities, IAppApi} from "~/backend/IAppApi";
 import {AddDownloadRequest} from "~/interfaces/AddDownloadRequest";
 import {NativeMessagingTransport} from "./nativemessaging/NativeMessagingTransport";
 
@@ -61,5 +61,14 @@ export class NativeMessagingApi implements IAppApi {
             null,
         );
         return true;
+    }
+
+    async getCapabilities(): Promise<AppCapabilities | null> {
+        try {
+            return await this.transport.requestTyped<AppCapabilities>("capabilities", null);
+        } catch (e) {
+            // older native hosts don't know this action
+            return null;
+        }
     }
 }
