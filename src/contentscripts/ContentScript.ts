@@ -51,7 +51,7 @@ export default defineExtensionEntry()
             })
             MediaPopup.setItemClickListener((media) => {
                 const addDownloadType = media.type
-                if (media.downloadable === false || addDownloadType === "dash") {
+                if (media.downloadable === false) {
                     // e.g. DASH: listed so the user knows it's there, but the app can't download it yet
                     alert(createAlertStringForMyExtension(
                         `${media.displayName ?? "This video"}: ${media.note ?? "not supported yet"}`
@@ -96,14 +96,14 @@ export default defineExtensionEntry()
                     })
                     return
                 }
-                if ((addDownloadType === "av" && media.avJob) || addDownloadType === "page") {
+                if ((addDownloadType === "av" && media.avJob) || addDownloadType === "page" || addDownloadType === "dash") {
                     // separate video + audio files merged by the app, or a page for the app's site downloader:
                     // only for an app that supports the job type
                     const job = media.avJob
                     run(async () => {
                         let supported = false
                         try {
-                            supported = await sendMessage(DefinedCommands.IS_JOB_TYPE_SUPPORTED, addDownloadType, "background")
+                            supported = await sendMessage(DefinedCommands.IS_JOB_TYPE_SUPPORTED, addDownloadType === "av" ? "av" : "page", "background")
                         } catch (e) {
                             supported = false
                         }
@@ -125,11 +125,12 @@ export default defineExtensionEntry()
                             duration: job.duration ?? null,
                             quality: job.quality,
                         } : {
+                            // a video page (or a DASH manifest): the app reads it with yt-dlp
                             link: media.uri,
                             suggestedName: null,
                             type: "page",
                             downloadPage: location.href,
-                            headers: null,
+                            headers: addDownloadType === "dash" ? media.requestHeaders ?? null : null,
                             description: null,
                         }])
                         MediaPopup.toggleList(false)

@@ -7,6 +7,7 @@ import * as HLSUtils from "~/media/HLSUtils"
 import {DefinedCommands} from "~/message/Commands";
 import {TabMediaStore} from "~/media/TabMediaStore";
 import type {ResourceProbeResult, SegmentProbeRequest, SegmentProbeResult} from "~/media/SegmentUtils";
+import * as Backend from "~/backend/Backend";
 
 type FrameRef = { tabId: number, frameId: number }
 
@@ -31,7 +32,8 @@ export class MediaRegistry implements OnMediaInterceptedFromRequestListener {
                         onDownloadableMediaProcessed(tabId, frameId, list)
                     }
                 }, this.store, (frameId, request) => probeFromPage(tabId, frameId, request),
-                    (frameId, url) => probeResourceFromPage(tabId, frameId, url))
+                    (frameId, url) => probeResourceFromPage(tabId, frameId, url),
+                    () => Backend.isJobTypeSupported("page"))
                 await mediaOnTab.restore()
                 return mediaOnTab
             })()
@@ -55,9 +57,16 @@ export class MediaRegistry implements OnMediaInterceptedFromRequestListener {
             (tabId, changeInfo, _) => {
                 if (changeInfo.status === "loading" || changeInfo.url) {
                     // new page: forget media of the previous one (in memory and in storage)
-                    this.tabs.get(tabId)?.then(p => p.reset())
+                    // (single-page sites like YouTube change the URL without loading: list again for the new page)
+                    this.tabs.get(tabId)?.then(p => {
+                        p.reset()
+                        if (changeInfo.url) p.publish()
+                    })
                     this.store.clear(tabId)
                     this.forgetFrames(ref => ref.tabId === tabId)
+                } else if (changeInfo.title) {
+                    // entries are named after the page title: list again when it changes
+                    this.tabs.get(tabId)?.then(p => p.publish())
                 }
             }
         )
