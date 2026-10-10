@@ -363,6 +363,7 @@ export type ResourceProbeResult = {
     // from the file's MP4 header (first bytes): what kind of track it holds and the picture height
     track?: SegmentTrack,
     height?: number,
+    duration?: number, // seconds
 }
 
 const HEADER_BYTES = 8 * 1024
@@ -372,12 +373,36 @@ const HEADER_BYTES = 8 * 1024
  * "tkhd" boxes end with width and height (16.16 fixed point). Servers often label audio files "video/mp4", so this
  * is the reliable way to tell a DASH-style audio file from a video file.
  */
-export function sniffMp4Header(bytes: Uint8Array): { track?: SegmentTrack, height?: number } {
+export function sniffMp4Header(bytes: Uint8Array): { track?: SegmentTrack, height?: number, duration?: number } {
     let video = false, audio = false, height = 0
+    let movieTimescale = 0, movieDuration = 0, fragmentDuration = 0, sidxDuration = 0
     const is = (i: number, tag: string) => bytes[i] === tag.charCodeAt(0) && bytes[i + 1] === tag.charCodeAt(1)
         && bytes[i + 2] === tag.charCodeAt(2) && bytes[i + 3] === tag.charCodeAt(3)
+    const u32 = (i: number) => i + 4 <= bytes.length
+        ? ((bytes[i] << 24) >>> 0) + (bytes[i + 1] << 16) + (bytes[i + 2] << 8) + bytes[i + 3] : 0
+    const u64 = (i: number) => u32(i) * 4294967296 + u32(i + 4)
     for (let i = 4; i + 16 <= bytes.length; i++) {
-        if (is(i, "hdlr")) {
+        if (is(i, "mvhd")) {
+            // version(1) flags(3), creation, modification, timescale, duration (32 or 64 bit)
+            const v1 = bytes[i + 4] === 1
+            movieTimescale = u32(i + (v1 ? 24 : 16))
+            movieDuration = v1 ? u64(i + 28) : u32(i + 20)
+        } else if (is(i, "mehd")) {
+            // fragmented files: total duration, in the movie timescale
+            fragmentDuration = bytes[i + 4] === 1 ? u64(i + 8) : u32(i + 8)
+        } else if (is(i, "sidx") && !sidxDuration) {
+            // segment index of an on-demand DASH file: the sum of its subsegment durations
+            const v1 = bytes[i + 4] === 1
+            const timescale = u32(i + 12)
+            const countAt = i + (v1 ? 34 : 26)
+            const count = countAt + 2 <= bytes.length ? (bytes[countAt] << 8) | bytes[countAt + 1] : 0
+            const refs = countAt + 2
+            if (timescale && count && refs + count * 12 <= bytes.length) {
+                let total = 0
+                for (let r = 0; r < count; r++) total += u32(refs + r * 12 + 4)
+                sidxDuration = total / timescale
+            }
+        } else if (is(i, "hdlr")) {
             // size(4) "hdlr"(4) version+flags(4) pre_defined(4) handler_type(4)
             if (is(i + 12, "vide")) video = true
             if (is(i + 12, "soun")) audio = true
@@ -392,7 +417,10 @@ export function sniffMp4Header(bytes: Uint8Array): { track?: SegmentTrack, heigh
         }
     }
     const track: SegmentTrack | undefined = video && audio ? "muxed" : video ? "video" : audio ? "audio" : undefined
-    return {track, height: video && height ? height : undefined}
+    const duration = movieTimescale && movieDuration ? movieDuration / movieTimescale
+        : movieTimescale && fragmentDuration ? fragmentDuration / movieTimescale
+            : sidxDuration || undefined
+    return {track, height: video && height ? height : undefined, duration}
 }
 
 async function readHead(response: Response, max: number): Promise<Uint8Array> {

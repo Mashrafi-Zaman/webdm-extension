@@ -114,6 +114,9 @@ type RangedResource = {
     // from the file's MP4 header (the probe reads its first 8 KB): works when the page hook can't tell which
     // player / SourceBuffer the bytes went to
     headerTrack?: SegmentTrack,
+    // media duration (s) from the MP4 header (mvhd / mehd / sidx): the video and audio files of one video share it,
+    // so it pairs them even when the page preloads other videos
+    headerDuration?: number,
     firstSeen?: number, // ms timestamp; pairs files with the player that started fetching at about the same time
     probe?: "running" | "done" | "failed",
     pieces: number,
@@ -392,7 +395,8 @@ export class MediaOnTab {
         }
         this.state.frameDurations[String(frameId)] = duration
         this.scheduleSave()
-        if (Object.values(this.state.segmentGroups).some(g => g.frameId === frameId)) {
+        if (Object.values(this.state.segmentGroups).some(g => g.frameId === frameId)
+            || Object.values(this.state.resources).some(r => r.frameId === frameId)) {
             await this.publish()
         }
     }
@@ -593,12 +597,8 @@ export class MediaOnTab {
      * video or audio and its picture height. One request for the first 8 KB.
      */
     private maybeProbeResource(resource: RangedResource, generation: number) {
+        // once per file: its header gives the duration that pairs it with the other track of the same video
         if (resource.probe) {
-            return
-        }
-        // the SourceBuffer type from the page hook already tells video from audio
-        const needsHeader = !resource.mime
-        if (resource.size !== undefined && resource.rangeSupported !== undefined && !needsHeader) {
             return
         }
         if (this.runningResourceProbes >= 3) {
@@ -621,6 +621,7 @@ export class MediaOnTab {
                     }
                     if (result.track) resource.headerTrack = result.track
                     if (result.height && !resource.height) resource.height = result.height
+                    if (result.duration) resource.headerDuration = result.duration
                     resource.track = rangedResourceTrack(resource)
                 }
                 resource.probe = result ? "done" : "failed"
@@ -1037,7 +1038,7 @@ function buildRangedStreams(
         !state.entries[r.url] && !framesWithHls.has(r.frameId)
     )
     const entriesPerFrame = new Map<number, number>()
-    for (const members of groupRangedResources(resources)) {
+    for (const members of groupRangedResources(resources, state)) {
         if (members.some(r => r.probe === "running")) continue // sizes still coming
         const frameId = members[0].frameId
         const frameUrl = state.frames[String(frameId)]
@@ -1057,7 +1058,7 @@ function buildRangedStreams(
         const sorted = _.orderBy(videos, [v => v.height ?? 0, v => v.size ?? 0], ["desc", "desc"])
         const usedLabels = new Map<string, number>()
         const qualities: DownloadableMediaQuality[] = sorted.map((video, i) => {
-            const duration = video.duration ?? audio?.duration ?? state.frameDurations[String(frameId)]
+            const duration = durationOf(video) ?? (audio ? durationOf(audio) : undefined) ?? state.frameDurations[String(frameId)]
             let label = video.height ? `${video.height}p`
                 : video.size && duration ? createBandwidthString(video.size * 8 / duration)
                     : `Quality ${i + 1}`
@@ -1120,28 +1121,77 @@ const isAudio = (r: RangedResource) => r.track === "audio"
  * seen closest in time; in a frame without known players they form one group. Leftover files of only one kind in a
  * frame with players are not listed (they'd be a video without sound or a sound without video).
  */
-function groupRangedResources(resources: RangedResource[]): RangedResource[][] {
+const durationOf = (r: RangedResource) => r.headerDuration ?? r.duration
+const sameDuration = (a: number, b: number) => Math.abs(a - b) <= Math.max(0.5, Math.max(a, b) * 0.03)
+const seenAt = (group: RangedResource[]) => _.min(group.map(r => r.firstSeen ?? 0)) ?? 0
+
+/**
+ * Files grouped per video, in the order to list them (the video that is playing first):
+ * - by media duration from the MP4 headers: the video files (qualities) and the audio file of one video share it,
+ *   other videos the page preloads (e.g. the next reels) almost never have the same length
+ * - two videos of the same length are told apart by their player (MediaSource), when the page hook knows it
+ * - files whose duration is unknown join the group of their player, or the group lacking that kind of track that
+ *   was seen closest in time
+ * Without any known durations it falls back to grouping by player only.
+ */
+function groupRangedResources(resources: RangedResource[], state: TabMediaState): RangedResource[][] {
     const result: RangedResource[][] = []
     for (const frameResources of Object.values(_.groupBy(resources, r => r.frameId))) {
-        const players = Object.values(_.groupBy(frameResources.filter(r => r.mediaSource !== undefined), r => r.mediaSource))
-        const loose = frameResources.filter(r => r.mediaSource === undefined)
-        if (!players.length) {
-            result.push(loose)
+        const known = frameResources.filter(r => durationOf(r) !== undefined)
+        if (!known.length) {
+            result.push(...groupByPlayer(frameResources))
             continue
         }
-        const seenAt = (group: RangedResource[]) => _.min(group.map(r => r.firstSeen ?? 0)) ?? 0
-        const remaining: RangedResource[] = []
-        for (const file of _.sortBy(loose, r => r.firstSeen ?? 0)) {
-            const wantsAudio = isAudio(file)
-            const candidates = players.filter(g => wantsAudio ? !g.some(isAudio) : !g.some(r => !isAudio(r)))
-            const target = _.minBy(candidates, g => Math.abs(seenAt(g) - (file.firstSeen ?? 0)))
-            if (target) target.push(file)
-            else remaining.push(file)
+        // 1) clusters of equal duration
+        const clusters: { duration: number, files: RangedResource[] }[] = []
+        for (const file of _.sortBy(known, r => durationOf(r)!)) {
+            const d = durationOf(file)!
+            const cluster = clusters.find(c => sameDuration(c.duration, d))
+            if (cluster) cluster.files.push(file)
+            else clusters.push({duration: d, files: [file]})
         }
-        result.push(...players)
-        if (remaining.some(isAudio) && remaining.some(r => !isAudio(r))) {
-            result.push(remaining)
+        // 2) one cluster holding several players' videos (two videos of the same length): split it per player
+        let groups: RangedResource[][] = clusters.flatMap(c => {
+            const players = _.uniq(c.files.filter(r => r.mediaSource !== undefined && !isAudio(r)).map(r => r.mediaSource))
+            return players.length > 1 ? groupByPlayer(c.files) : [c.files]
+        })
+        // 3) files of unknown duration
+        for (const file of _.sortBy(frameResources.filter(r => durationOf(r) === undefined), r => r.firstSeen ?? 0)) {
+            const byPlayer = file.mediaSource !== undefined
+                ? groups.find(g => g.some(r => r.mediaSource === file.mediaSource)) : undefined
+            const lacking = groups.filter(g => isAudio(file) ? !g.some(isAudio) : !g.some(r => !isAudio(r)))
+            const target = byPlayer ?? _.minBy(lacking, g => Math.abs(seenAt(g) - (file.firstSeen ?? 0)))
+            target?.push(file)
         }
+        // the video that is playing (its duration, reported by the frame) first, then in the order they appeared
+        const playing = state.frameDurations[String(frameResources[0].frameId)]
+        groups = _.sortBy(groups, [
+            g => playing !== undefined && g.some(r => durationOf(r) !== undefined && sameDuration(durationOf(r)!, playing)) ? 0 : 1,
+            g => seenAt(g),
+        ])
+        result.push(...groups)
+    }
+    return result
+}
+
+/** Files per player (MediaSource); files without a known player join the player lacking that kind of track. */
+function groupByPlayer(frameResources: RangedResource[]): RangedResource[][] {
+    const players = Object.values(_.groupBy(frameResources.filter(r => r.mediaSource !== undefined), r => r.mediaSource))
+    const loose = frameResources.filter(r => r.mediaSource === undefined)
+    if (!players.length) {
+        return [loose]
+    }
+    const remaining: RangedResource[] = []
+    for (const file of _.sortBy(loose, r => r.firstSeen ?? 0)) {
+        const wantsAudio = isAudio(file)
+        const candidates = players.filter(g => wantsAudio ? !g.some(isAudio) : !g.some(r => !isAudio(r)))
+        const target = _.minBy(candidates, g => Math.abs(seenAt(g) - (file.firstSeen ?? 0)))
+        if (target) target.push(file)
+        else remaining.push(file)
+    }
+    const result = [...players]
+    if (remaining.some(isAudio) && remaining.some(r => !isAudio(r))) {
+        result.push(remaining)
     }
     return result
 }
