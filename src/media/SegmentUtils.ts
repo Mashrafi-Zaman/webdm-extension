@@ -356,9 +356,75 @@ export function totalFromContentRange(contentRange: string | null | undefined): 
     return total ? parseInt(total) : undefined
 }
 
-export type ResourceProbeResult = { size?: number, rangeSupported: boolean, contentType?: string }
+export type ResourceProbeResult = {
+    size?: number,
+    rangeSupported: boolean,
+    contentType?: string,
+    // from the file's MP4 header (first bytes): what kind of track it holds and the picture height
+    track?: SegmentTrack,
+    height?: number,
+}
 
-/** Full size of a file and whether its server answers Range requests (one "Range: bytes=0-0" request). */
+const HEADER_BYTES = 8 * 1024
+
+/**
+ * Track type and picture height from the start of an MP4 file: "hdlr" boxes name the handler ("vide" / "soun"),
+ * "tkhd" boxes end with width and height (16.16 fixed point). Servers often label audio files "video/mp4", so this
+ * is the reliable way to tell a DASH-style audio file from a video file.
+ */
+export function sniffMp4Header(bytes: Uint8Array): { track?: SegmentTrack, height?: number } {
+    let video = false, audio = false, height = 0
+    const is = (i: number, tag: string) => bytes[i] === tag.charCodeAt(0) && bytes[i + 1] === tag.charCodeAt(1)
+        && bytes[i + 2] === tag.charCodeAt(2) && bytes[i + 3] === tag.charCodeAt(3)
+    for (let i = 4; i + 16 <= bytes.length; i++) {
+        if (is(i, "hdlr")) {
+            // size(4) "hdlr"(4) version+flags(4) pre_defined(4) handler_type(4)
+            if (is(i + 12, "vide")) video = true
+            if (is(i + 12, "soun")) audio = true
+        } else if (is(i, "tkhd")) {
+            const start = i - 4
+            const size = ((bytes[start] << 24) >>> 0) + (bytes[start + 1] << 16) + (bytes[start + 2] << 8) + bytes[start + 3]
+            if (size >= 84 && start + size <= bytes.length) {
+                const h = start + size - 4
+                const value = (bytes[h] << 8) | bytes[h + 1]
+                if (value <= 8640) height = Math.max(height, value)
+            }
+        }
+    }
+    const track: SegmentTrack | undefined = video && audio ? "muxed" : video ? "video" : audio ? "audio" : undefined
+    return {track, height: video && height ? height : undefined}
+}
+
+async function readHead(response: Response, max: number): Promise<Uint8Array> {
+    const reader = response.body?.getReader()
+    if (!reader) return new Uint8Array()
+    const chunks: Uint8Array[] = []
+    let total = 0
+    try {
+        while (total < max) {
+            const {done, value} = await reader.read()
+            if (done || !value) break
+            chunks.push(value)
+            total += value.length
+        }
+    } finally {
+        reader.cancel().catch(() => undefined)
+    }
+    const head = new Uint8Array(Math.min(total, max))
+    let offset = 0
+    for (const chunk of chunks) {
+        const part = chunk.subarray(0, Math.min(chunk.length, head.length - offset))
+        head.set(part, offset)
+        offset += part.length
+        if (offset >= head.length) break
+    }
+    return head
+}
+
+/**
+ * Full size of a file, whether its server answers Range requests, and its track type / picture height from its
+ * MP4 header: one "Range: bytes=0-8191" request (only the first 8 KB are read even if the range is ignored).
+ */
 export async function probeResourceWithFetch(url: string, headers: Record<string, string> = {}, init: RequestInit = {}): Promise<ResourceProbeResult | null> {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), 10_000)
@@ -367,7 +433,7 @@ export async function probeResourceWithFetch(url: string, headers: Record<string
         Object.entries(headers).forEach(([k, v]) => {
             if (k.toLowerCase() !== "range") requestHeaders[k] = v
         })
-        requestHeaders["Range"] = "bytes=0-0"
+        requestHeaders["Range"] = `bytes=0-${HEADER_BYTES - 1}`
         const response = await fetch(url, {...init, headers: requestHeaders, signal: controller.signal})
         const contentType = response.headers.get("Content-Type") ?? undefined
         let result: ResourceProbeResult | null = null
@@ -376,10 +442,14 @@ export async function probeResourceWithFetch(url: string, headers: Record<string
         } else if (response.status === 200) {
             result = {size: Number(response.headers.get("Content-Length")) || undefined, rangeSupported: false, contentType}
         }
-        try {
-            await response.body?.cancel()
-        } catch (e) {
-            // ignore
+        if (result) {
+            try {
+                Object.assign(result, sniffMp4Header(await readHead(response, HEADER_BYTES)))
+            } catch (e) {
+                // no header info
+            }
+        } else {
+            response.body?.cancel().catch(() => undefined)
         }
         return result
     } catch (e) {

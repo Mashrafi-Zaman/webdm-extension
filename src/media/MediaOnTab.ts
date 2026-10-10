@@ -111,6 +111,10 @@ type RangedResource = {
     duration?: number, // s, from the MediaSource
     size?: number, // the full file, not a piece
     rangeSupported?: boolean, // the server answers Range requests with 206
+    // from the file's MP4 header (the probe reads its first 8 KB): works when the page hook can't tell which
+    // player / SourceBuffer the bytes went to
+    headerTrack?: SegmentTrack,
+    firstSeen?: number, // ms timestamp; pairs files with the player that started fetching at about the same time
     probe?: "running" | "done" | "failed",
     pieces: number,
 }
@@ -553,7 +557,7 @@ export class MediaOnTab {
         let resource = this.state.resources[url]
         const isNew = !resource
         if (!resource) {
-            resource = {url, frameId: target.frameId, headers: target.headers, track: "unknown", pieces: 0}
+            resource = {url, frameId: target.frameId, headers: target.headers, track: "unknown", pieces: 0, firstSeen: Date.now()}
             this.state.resources[url] = resource
         }
         const listed = () => JSON.stringify([resource.track, resource.mediaSource, resource.height, resource.duration, resource.size])
@@ -584,9 +588,17 @@ export class MediaOnTab {
 
     private runningResourceProbes = 0
 
-    /** The full size of a file and whether its server answers Range requests (one 1-byte request). */
+    /**
+     * The full size of a file, whether its server answers Range requests, and (from its MP4 header) whether it is
+     * video or audio and its picture height. One request for the first 8 KB.
+     */
     private maybeProbeResource(resource: RangedResource, generation: number) {
-        if (resource.probe || (resource.size !== undefined && resource.rangeSupported !== undefined)) {
+        if (resource.probe) {
+            return
+        }
+        // the SourceBuffer type from the page hook already tells video from audio
+        const needsHeader = !resource.mime
+        if (resource.size !== undefined && resource.rangeSupported !== undefined && !needsHeader) {
             return
         }
         if (this.runningResourceProbes >= 3) {
@@ -606,8 +618,10 @@ export class MediaOnTab {
                     resource.rangeSupported = result.rangeSupported
                     if (result.contentType && /^(video|audio)\//i.test(result.contentType)) {
                         resource.contentType ??= result.contentType
-                        resource.track = rangedResourceTrack(resource)
                     }
+                    if (result.track) resource.headerTrack = result.track
+                    if (result.height && !resource.height) resource.height = result.height
+                    resource.track = rangedResourceTrack(resource)
                 }
                 resource.probe = result ? "done" : "failed"
             } catch (e) {
@@ -998,6 +1012,7 @@ function rangedResourceTrack(resource: RangedResource): SegmentTrack {
     }
     const hints = SegmentUtils.urlHints(resource.url)
     return fromType(resource.mime)
+        ?? resource.headerTrack
         ?? (fromType(resource.contentType) === "audio" ? "audio" : null)
         ?? (hints.track !== "unknown" ? hints.track : null)
         ?? fromType(resource.contentType)
@@ -1021,13 +1036,8 @@ function buildRangedStreams(
         // a plain <video src> file is already listed as a file; HLS byte-range streams are listed as HLS
         !state.entries[r.url] && !framesWithHls.has(r.frameId)
     )
-    const framesWithPlayers = new Set(resources.filter(r => r.mediaSource !== undefined).map(r => r.frameId))
-    const groups = _.groupBy(
-        resources.filter(r => r.mediaSource !== undefined || !framesWithPlayers.has(r.frameId)),
-        r => r.mediaSource !== undefined ? `${r.frameId}:${r.mediaSource}` : `${r.frameId}:-`,
-    )
     const entriesPerFrame = new Map<number, number>()
-    for (const members of Object.values(groups)) {
+    for (const members of groupRangedResources(resources)) {
         if (members.some(r => r.probe === "running")) continue // sizes still coming
         const frameId = members[0].frameId
         const frameUrl = state.frames[String(frameId)]
@@ -1066,7 +1076,9 @@ function buildRangedStreams(
                 duration: duration ? createDurationString(duration) : undefined,
                 extension,
                 size: size !== undefined ? createSizeString(size) : undefined,
-                note: audio ? "video + audio" : audioOnly ? "audio" : undefined,
+                note: audio ? "video + audio"
+                    : audioOnly ? "audio only"
+                        : video.track === "video" ? "video only (no sound track found)" : undefined,
                 type: audio ? "av" : "http",
                 avJob: audio ? {
                     video: video.url,
@@ -1098,6 +1110,40 @@ function buildRangedStreams(
         if (tinyOnly) addTiny(frameId, item)
         else add(frameId, item)
     }
+}
+
+const isAudio = (r: RangedResource) => r.track === "audio"
+
+/**
+ * Files grouped per video: by the player (MediaSource) the page hook saw them go to. Files the hook couldn't tie to
+ * a player (e.g. bytes read from a stream) join the player in the same frame that lacks that kind of track and was
+ * seen closest in time; in a frame without known players they form one group. Leftover files of only one kind in a
+ * frame with players are not listed (they'd be a video without sound or a sound without video).
+ */
+function groupRangedResources(resources: RangedResource[]): RangedResource[][] {
+    const result: RangedResource[][] = []
+    for (const frameResources of Object.values(_.groupBy(resources, r => r.frameId))) {
+        const players = Object.values(_.groupBy(frameResources.filter(r => r.mediaSource !== undefined), r => r.mediaSource))
+        const loose = frameResources.filter(r => r.mediaSource === undefined)
+        if (!players.length) {
+            result.push(loose)
+            continue
+        }
+        const seenAt = (group: RangedResource[]) => _.min(group.map(r => r.firstSeen ?? 0)) ?? 0
+        const remaining: RangedResource[] = []
+        for (const file of _.sortBy(loose, r => r.firstSeen ?? 0)) {
+            const wantsAudio = isAudio(file)
+            const candidates = players.filter(g => wantsAudio ? !g.some(isAudio) : !g.some(r => !isAudio(r)))
+            const target = _.minBy(candidates, g => Math.abs(seenAt(g) - (file.firstSeen ?? 0)))
+            if (target) target.push(file)
+            else remaining.push(file)
+        }
+        result.push(...players)
+        if (remaining.some(isAudio) && remaining.some(r => !isAudio(r))) {
+            result.push(remaining)
+        }
+    }
+    return result
 }
 
 function audioExtension(resource: RangedResource): string {
