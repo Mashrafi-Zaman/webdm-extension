@@ -1286,7 +1286,7 @@ export function buildDownloadableMediaLists(state: TabMediaState, pageInfo: Page
         }
         list.push(item)
     }
-    // tiny files (< 64 KB) are listed only in frames where nothing else was found
+    // tiny byte-range files (< 64 KB) are listed only in frames where nothing else was found
     const tiny = new Map<number, DownloadableMedia[]>()
     const addTiny = (frameId: number, item: DownloadableMedia) => {
         tiny.set(frameId, [...(tiny.get(frameId) ?? []), item])
@@ -1362,8 +1362,10 @@ export function buildDownloadableMediaLists(state: TabMediaState, pageInfo: Page
                 name = pageInfo.pageTitle
                 mediaProps.push(pageInfo.pageTitle, pageInfo.pageUrlHash)
             }
-            const isTiny = entry.size !== undefined && entry.size < MIN_LISTED_SIZE
-            ;(isTiny ? addTiny : add)(entry.frameId, {
+            // a whole audio/video file under 64 KB is a UI sound, an earcon or a probe (e.g. a site's voice-search
+            // "open"/"success" mp3s), never something to download: not listed, not even as a fallback
+            if (entry.size !== undefined && entry.size < MIN_LISTED_SIZE) continue
+            add(entry.frameId, {
                 type: "http",
                 uri: entry.url,
                 requestHeaders: withReferer(entry.requestHeaders, state.frames[String(entry.frameId)]),
