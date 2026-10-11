@@ -1,6 +1,6 @@
 {
   "name": "ab-download-manager-browser-integration",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "displayName": "WebDM Integration",
   "author": "AmirHossein Abdolmotallebi",
   "description": "Download files with the Web Download Manager (WebDM) app",
